@@ -8,6 +8,7 @@ from uuid import uuid4
 
 
 TWOPLACES = Decimal("0.01")
+INVESTMENT_ASSET_TYPES = ("stocks", "bonds", "etf")
 
 
 class AccountStatus(Enum):
@@ -187,6 +188,11 @@ class AbstractAccount(ABC):
     def _masked_account_id(self) -> str:
         return f"****{self.account_id[-4:]}"
 
+    @staticmethod
+    def _normalize_rate(rate: Decimal | int | float | str) -> Decimal:
+        normalized_rate = AbstractAccount._normalize_amount(rate, allow_zero=True)
+        return (normalized_rate / Decimal("100")).quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
+
 
 class BankAccount(AbstractAccount):
     def deposit(self, amount: Decimal | int | float | str) -> Decimal:
@@ -242,5 +248,194 @@ class BankAccount(AbstractAccount):
             f"{self._masked_account_id()}, "
             f"{self.status.value}, "
             f"{self._balance:.2f} {self.currency.value}"
+            f")"
+        )
+
+
+class SavingsAccount(BankAccount):
+    def __init__(
+        self,
+        owner: Owner,
+        balance: Decimal | int | float | str = Decimal("0.00"),
+        account_id: str | None = None,
+        status: AccountStatus | str = AccountStatus.ACTIVE,
+        currency: Currency | str = Currency.RUB,
+        min_balance: Decimal | int | float | str = Decimal("0.00"),
+        monthly_interest_rate: Decimal | int | float | str = Decimal("0.00"),
+    ) -> None:
+        super().__init__(owner, balance, account_id, status, currency)
+        self.min_balance = self._normalize_amount(min_balance, allow_zero=True)
+        self.monthly_interest_rate = self._normalize_rate(monthly_interest_rate)
+
+    def withdraw(self, amount: Decimal | int | float | str) -> Decimal:
+        self._ensure_operations_allowed()
+        normalized_amount = self._normalize_amount(amount)
+        projected_balance = (self._balance - normalized_amount).quantize(TWOPLACES, rounding=ROUND_HALF_UP)
+        if projected_balance < self.min_balance:
+            raise InvalidOperationError("minimum balance requirement would be violated")
+        self._balance = projected_balance
+        return self._balance
+
+    def apply_monthly_interest(self) -> Decimal:
+        self._ensure_operations_allowed()
+        interest = (self._balance * self.monthly_interest_rate).quantize(TWOPLACES, rounding=ROUND_HALF_UP)
+        self._balance = (self._balance + interest).quantize(TWOPLACES, rounding=ROUND_HALF_UP)
+        return self._balance
+
+    def get_account_info(self) -> dict[str, object]:
+        info = super().get_account_info()
+        info.update(
+            {
+                "min_balance": f"{self.min_balance:.2f}",
+                "monthly_interest_rate": f"{(self.monthly_interest_rate * Decimal('100')):.2f}%",
+            }
+        )
+        return info
+
+    def __str__(self) -> str:
+        return (
+            f"{self.__class__.__name__}("
+            f"{self.owner.full_name}, "
+            f"{self._masked_account_id()}, "
+            f"{self.status.value}, "
+            f"{self._balance:.2f} {self.currency.value}, "
+            f"min_balance={self.min_balance:.2f}, "
+            f"monthly_interest={(self.monthly_interest_rate * Decimal('100')):.2f}%"
+            f")"
+        )
+
+
+class PremiumAccount(BankAccount):
+    def __init__(
+        self,
+        owner: Owner,
+        balance: Decimal | int | float | str = Decimal("0.00"),
+        account_id: str | None = None,
+        status: AccountStatus | str = AccountStatus.ACTIVE,
+        currency: Currency | str = Currency.RUB,
+        overdraft_limit: Decimal | int | float | str = Decimal("0.00"),
+        fixed_commission: Decimal | int | float | str = Decimal("0.00"),
+        single_withdrawal_limit: Decimal | int | float | str = Decimal("500000.00"),
+    ) -> None:
+        super().__init__(owner, balance, account_id, status, currency)
+        self.overdraft_limit = self._normalize_amount(overdraft_limit, allow_zero=True)
+        self.fixed_commission = self._normalize_amount(fixed_commission, allow_zero=True)
+        self.single_withdrawal_limit = self._normalize_amount(single_withdrawal_limit, allow_zero=True)
+
+    def withdraw(self, amount: Decimal | int | float | str) -> Decimal:
+        self._ensure_operations_allowed()
+        normalized_amount = self._normalize_amount(amount)
+        if normalized_amount > self.single_withdrawal_limit:
+            raise InvalidOperationError("single withdrawal limit exceeded")
+        total_charge = (normalized_amount + self.fixed_commission).quantize(TWOPLACES, rounding=ROUND_HALF_UP)
+        allowed_min_balance = (Decimal("0.00") - self.overdraft_limit).quantize(TWOPLACES, rounding=ROUND_HALF_UP)
+        projected_balance = (self._balance - total_charge).quantize(TWOPLACES, rounding=ROUND_HALF_UP)
+        if projected_balance < allowed_min_balance:
+            raise InsufficientFundsError("overdraft limit exceeded")
+        self._balance = projected_balance
+        return self._balance
+
+    def get_account_info(self) -> dict[str, object]:
+        info = super().get_account_info()
+        info.update(
+            {
+                "overdraft_limit": f"{self.overdraft_limit:.2f}",
+                "fixed_commission": f"{self.fixed_commission:.2f}",
+                "single_withdrawal_limit": f"{self.single_withdrawal_limit:.2f}",
+            }
+        )
+        return info
+
+    def __str__(self) -> str:
+        return (
+            f"{self.__class__.__name__}("
+            f"{self.owner.full_name}, "
+            f"{self._masked_account_id()}, "
+            f"{self.status.value}, "
+            f"{self._balance:.2f} {self.currency.value}, "
+            f"overdraft={self.overdraft_limit:.2f}, "
+            f"commission={self.fixed_commission:.2f}"
+            f")"
+        )
+
+
+class InvestmentAccount(BankAccount):
+    def __init__(
+        self,
+        owner: Owner,
+        balance: Decimal | int | float | str = Decimal("0.00"),
+        account_id: str | None = None,
+        status: AccountStatus | str = AccountStatus.ACTIVE,
+        currency: Currency | str = Currency.RUB,
+        portfolio: dict[str, Decimal | int | float | str] | None = None,
+    ) -> None:
+        super().__init__(owner, balance, account_id, status, currency)
+        self.portfolio = self._normalize_portfolio(portfolio)
+
+    def _normalize_portfolio(
+        self,
+        portfolio: dict[str, Decimal | int | float | str] | None,
+    ) -> dict[str, Decimal]:
+        normalized_portfolio = {asset_type: Decimal("0.00") for asset_type in INVESTMENT_ASSET_TYPES}
+        if portfolio is None:
+            return normalized_portfolio
+        if not isinstance(portfolio, dict):
+            raise InvalidOperationError("portfolio must be a dictionary")
+        for asset_type, asset_value in portfolio.items():
+            if asset_type not in INVESTMENT_ASSET_TYPES:
+                raise InvalidOperationError("unsupported portfolio asset type")
+            normalized_portfolio[asset_type] = self._normalize_amount(asset_value, allow_zero=True)
+        return normalized_portfolio
+
+    def _portfolio_total_value(self) -> Decimal:
+        total_value = sum(self.portfolio.values(), Decimal("0.00"))
+        return total_value.quantize(TWOPLACES, rounding=ROUND_HALF_UP)
+
+    def withdraw(self, amount: Decimal | int | float | str) -> Decimal:
+        self._ensure_operations_allowed()
+        normalized_amount = self._normalize_amount(amount)
+        available_total = (self._balance + self._portfolio_total_value()).quantize(TWOPLACES, rounding=ROUND_HALF_UP)
+        if normalized_amount > available_total:
+            raise InsufficientFundsError("insufficient funds and portfolio value")
+        if normalized_amount <= self._balance:
+            self._balance = (self._balance - normalized_amount).quantize(TWOPLACES, rounding=ROUND_HALF_UP)
+            return self._balance
+        remaining_amount = (normalized_amount - self._balance).quantize(TWOPLACES, rounding=ROUND_HALF_UP)
+        self._balance = Decimal("0.00")
+        for asset_type in INVESTMENT_ASSET_TYPES:
+            asset_value = self.portfolio[asset_type]
+            if remaining_amount <= 0:
+                break
+            deduction = min(asset_value, remaining_amount)
+            self.portfolio[asset_type] = (asset_value - deduction).quantize(TWOPLACES, rounding=ROUND_HALF_UP)
+            remaining_amount = (remaining_amount - deduction).quantize(TWOPLACES, rounding=ROUND_HALF_UP)
+        return self._balance
+
+    def project_yearly_growth(self, yearly_growth_rate: Decimal | int | float | str) -> Decimal:
+        normalized_rate = self._normalize_rate(yearly_growth_rate)
+        projected_value = (self._portfolio_total_value() * (Decimal("1.00") + normalized_rate)).quantize(
+            TWOPLACES,
+            rounding=ROUND_HALF_UP,
+        )
+        return projected_value
+
+    def get_account_info(self) -> dict[str, object]:
+        info = super().get_account_info()
+        info.update(
+            {
+                "portfolio": {asset_type: f"{asset_value:.2f}" for asset_type, asset_value in self.portfolio.items()},
+                "portfolio_total": f"{self._portfolio_total_value():.2f}",
+            }
+        )
+        return info
+
+    def __str__(self) -> str:
+        return (
+            f"{self.__class__.__name__}("
+            f"{self.owner.full_name}, "
+            f"{self._masked_account_id()}, "
+            f"{self.status.value}, "
+            f"cash={self._balance:.2f} {self.currency.value}, "
+            f"portfolio_total={self._portfolio_total_value():.2f}"
             f")"
         )

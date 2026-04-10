@@ -8,9 +8,12 @@ from src.models import (
     AccountStatus,
     BankAccount,
     Currency,
+    InvestmentAccount,
     InsufficientFundsError,
     InvalidOperationError,
     Owner,
+    PremiumAccount,
+    SavingsAccount,
 )
 
 
@@ -143,6 +146,88 @@ class BankAccountTestCase(unittest.TestCase):
 
         with self.assertRaises(InvalidOperationError):
             Owner(full_name="User", email="invalid-email", phone="+70000000000")
+
+    def test_savings_account_applies_monthly_interest(self) -> None:
+        account = SavingsAccount(
+            owner=self.owner,
+            balance="1000.00",
+            min_balance="100.00",
+            monthly_interest_rate="5",
+            currency="USD",
+        )
+
+        new_balance = account.apply_monthly_interest()
+
+        self.assertEqual(new_balance, Decimal("1050.00"))
+        self.assertIn("monthly_interest_rate", account.get_account_info())
+        self.assertIn("SavingsAccount", str(account))
+
+    def test_savings_account_respects_min_balance(self) -> None:
+        account = SavingsAccount(
+            owner=self.owner,
+            balance="500.00",
+            min_balance="200.00",
+        )
+
+        with self.assertRaises(InvalidOperationError):
+            account.withdraw("350.00")
+
+    def test_premium_account_allows_overdraft_and_charges_commission(self) -> None:
+        account = PremiumAccount(
+            owner=self.owner,
+            balance="100.00",
+            overdraft_limit="200.00",
+            fixed_commission="10.00",
+            single_withdrawal_limit="500.00",
+            currency="EUR",
+        )
+
+        new_balance = account.withdraw("250.00")
+
+        self.assertEqual(new_balance, Decimal("-160.00"))
+        info = account.get_account_info()
+        self.assertEqual(info["fixed_commission"], "10.00")
+        self.assertIn("PremiumAccount", str(account))
+
+    def test_premium_account_rejects_withdrawal_above_overdraft_limit(self) -> None:
+        account = PremiumAccount(
+            owner=self.owner,
+            balance="100.00",
+            overdraft_limit="50.00",
+            fixed_commission="10.00",
+            single_withdrawal_limit="500.00",
+        )
+
+        with self.assertRaises(InsufficientFundsError):
+            account.withdraw("150.00")
+
+    def test_investment_account_projects_growth(self) -> None:
+        account = InvestmentAccount(
+            owner=self.owner,
+            balance="300.00",
+            currency="USD",
+            portfolio={"stocks": "1000.00", "bonds": "500.00", "etf": "500.00"},
+        )
+
+        projected_value = account.project_yearly_growth("10")
+
+        self.assertEqual(projected_value, Decimal("2200.00"))
+        info = account.get_account_info()
+        self.assertEqual(info["portfolio_total"], "2000.00")
+        self.assertIn("InvestmentAccount", str(account))
+
+    def test_investment_account_can_withdraw_from_cash_and_portfolio(self) -> None:
+        account = InvestmentAccount(
+            owner=self.owner,
+            balance="100.00",
+            portfolio={"stocks": "150.00", "bonds": "50.00", "etf": "0.00"},
+        )
+
+        new_balance = account.withdraw("220.00")
+
+        self.assertEqual(new_balance, Decimal("0.00"))
+        self.assertEqual(account.portfolio["stocks"], Decimal("30.00"))
+        self.assertEqual(account.portfolio["bonds"], Decimal("50.00"))
 
 
 if __name__ == "__main__":
