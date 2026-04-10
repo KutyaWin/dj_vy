@@ -1,12 +1,16 @@
 
 from decimal import Decimal
 import unittest
+from unittest.mock import patch
 
 from src.models import (
     AccountClosedError,
     AccountFrozenError,
     AccountStatus,
     BankAccount,
+    Bank,
+    Client,
+    ClientStatus,
     Currency,
     InvestmentAccount,
     InsufficientFundsError,
@@ -228,6 +232,110 @@ class BankAccountTestCase(unittest.TestCase):
         self.assertEqual(new_balance, Decimal("0.00"))
         self.assertEqual(account.portfolio["stocks"], Decimal("30.00"))
         self.assertEqual(account.portfolio["bonds"], Decimal("50.00"))
+
+
+class BankManagerTestCase(unittest.TestCase):
+    def setUp(self) -> None:
+        self.bank = Bank(name="My Bank")
+        self.client = Client(
+            full_name="Anna Smirnova",
+            email="anna.smirnova@example.com",
+            phone="+77005554433",
+            age=28,
+            pin_code="1234",
+        )
+        self.second_client = Client(
+            full_name="Boris Ivanov",
+            email="boris.ivanov@example.com",
+            phone="+77009998877",
+            age=35,
+            pin_code="5678",
+        )
+        self.bank.add_client(self.client)
+        self.bank.add_client(self.second_client)
+
+    def test_client_requires_adult_age(self) -> None:
+        with self.assertRaises(InvalidOperationError):
+            Client(
+                full_name="Young User",
+                email="young.user@example.com",
+                phone="+77001112233",
+                age=17,
+                pin_code="1234",
+            )
+
+    def test_open_account_creates_accounts_for_client(self) -> None:
+        bank_account = self.bank.open_account(self.client.client_id, account_type="bank", balance="100.00")
+        savings_account = self.bank.open_account(
+            self.client.client_id,
+            account_type="savings",
+            balance="500.00",
+            min_balance="50.00",
+            monthly_interest_rate="3",
+        )
+
+        self.assertIsInstance(bank_account, BankAccount)
+        self.assertIsInstance(savings_account, SavingsAccount)
+        self.assertEqual(len(self.client.account_ids), 2)
+
+    def test_authenticate_client_locks_after_three_failed_attempts(self) -> None:
+        with self.assertRaises(InvalidOperationError):
+            self.bank.authenticate_client(self.client.client_id, "9999")
+        with self.assertRaises(InvalidOperationError):
+            self.bank.authenticate_client(self.client.client_id, "9999")
+        with self.assertRaises(InvalidOperationError):
+            self.bank.authenticate_client(self.client.client_id, "9999")
+
+        self.assertTrue(self.client.is_locked)
+        self.assertEqual(self.client.status, ClientStatus.BLOCKED)
+        self.assertGreaterEqual(len(self.client.suspicious_activity), 1)
+
+    def test_authenticate_client_succeeds_with_correct_pin(self) -> None:
+        self.assertTrue(self.bank.authenticate_client(self.client.client_id, "1234"))
+        self.assertEqual(self.client.failed_auth_attempts, 0)
+
+    def test_freeze_unfreeze_and_close_account(self) -> None:
+        account = self.bank.open_account(self.client.client_id, account_type="premium", balance="400.00")
+
+        self.assertEqual(self.bank.freeze_account(account.account_id), AccountStatus.FROZEN)
+        self.assertEqual(self.bank.unfreeze_account(account.account_id), AccountStatus.ACTIVE)
+        self.assertEqual(self.bank.close_account(account.account_id), AccountStatus.CLOSED)
+
+    def test_restricted_hours_block_operations_and_mark_suspicious(self) -> None:
+        with patch.object(Bank, "_current_hour", return_value=1):
+            with self.assertRaises(InvalidOperationError):
+                self.bank.open_account(self.client.client_id, account_type="bank", balance="50.00")
+
+        self.assertEqual(self.client.status, ClientStatus.SUSPICIOUS)
+        self.assertIn("restricted hours operation: open_account", self.client.suspicious_activity)
+
+    def test_search_accounts_filters_by_client_and_type(self) -> None:
+        self.bank.open_account(self.client.client_id, account_type="bank", balance="100.00")
+        self.bank.open_account(self.client.client_id, account_type="investment", portfolio={"stocks": "300.00"})
+        self.bank.open_account(self.second_client.client_id, account_type="premium", balance="200.00")
+
+        matched_accounts = self.bank.search_accounts(client_id=self.client.client_id, account_type="investment")
+
+        self.assertEqual(len(matched_accounts), 1)
+        self.assertIsInstance(matched_accounts[0], InvestmentAccount)
+
+    def test_get_total_balance_and_clients_ranking(self) -> None:
+        self.bank.open_account(self.client.client_id, account_type="bank", balance="100.00")
+        self.bank.open_account(
+            self.client.client_id,
+            account_type="investment",
+            balance="50.00",
+            portfolio={"stocks": "250.00", "bonds": "100.00", "etf": "50.00"},
+        )
+        self.bank.open_account(self.second_client.client_id, account_type="bank", balance="300.00")
+
+        total_balance = self.bank.get_total_balance()
+        ranking = self.bank.get_clients_ranking()
+
+        self.assertEqual(total_balance, Decimal("850.00"))
+        self.assertEqual(ranking[0]["full_name"], "Anna Smirnova")
+        self.assertEqual(ranking[0]["total_assets"], "550.00")
+        self.assertEqual(ranking[1]["total_assets"], "300.00")
 
 
 if __name__ == "__main__":

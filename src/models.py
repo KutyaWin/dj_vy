@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from enum import Enum
 from uuid import uuid4
@@ -23,6 +24,12 @@ class Currency(Enum):
     EUR = "EUR"
     KZT = "KZT"
     CNY = "CNY"
+
+
+class ClientStatus(Enum):
+    ACTIVE = "active"
+    BLOCKED = "blocked"
+    SUSPICIOUS = "suspicious"
 
 
 class AccountFrozenError(Exception):
@@ -91,6 +98,80 @@ class Owner:
         visible_tail = self.phone[-2:] if len(self.phone) >= 2 else self.phone
         masked_head = "*" * max(len(self.phone) - len(visible_tail), 0)
         return f"{masked_head}{visible_tail}"
+
+
+@dataclass
+class Client:
+    full_name: str
+    email: str
+    phone: str
+    age: int
+    pin_code: str
+    client_id: str = field(default_factory=lambda: uuid4().hex[:8])
+    status: ClientStatus = ClientStatus.ACTIVE
+    account_ids: list[str] = field(default_factory=list)
+    failed_auth_attempts: int = 0
+    is_locked: bool = False
+    suspicious_activity: list[str] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        self.full_name = Owner._validate_text(self.full_name, "full_name")
+        self.email = Owner._validate_email(self.email)
+        self.phone = Owner._validate_text(self.phone, "phone")
+        self.pin_code = self._validate_pin_code(self.pin_code)
+        self.client_id = self._validate_client_id(self.client_id)
+        self.age = self._validate_age(self.age)
+        self.status = self._coerce_status(self.status)
+
+    @staticmethod
+    def _validate_age(age: int) -> int:
+        if not isinstance(age, int) or isinstance(age, bool):
+            raise InvalidOperationError("age must be an integer")
+        if age < 18:
+            raise InvalidOperationError("client must be at least 18 years old")
+        return age
+
+    @staticmethod
+    def _validate_pin_code(pin_code: str) -> str:
+        if not isinstance(pin_code, str) or not pin_code.isdigit() or len(pin_code) != 4:
+            raise InvalidOperationError("pin_code must be a 4-digit string")
+        return pin_code
+
+    @staticmethod
+    def _validate_client_id(client_id: str) -> str:
+        if not isinstance(client_id, str) or not client_id.strip():
+            raise InvalidOperationError("client_id must be a non-empty string")
+        return client_id.strip()
+
+    @staticmethod
+    def _coerce_status(status: ClientStatus | str) -> ClientStatus:
+        if isinstance(status, ClientStatus):
+            return status
+        if isinstance(status, str):
+            normalized_status = status.strip().lower()
+            for candidate in ClientStatus:
+                if candidate.value == normalized_status:
+                    return candidate
+        raise InvalidOperationError("unsupported client status")
+
+    def add_account_id(self, account_id: str) -> None:
+        if account_id not in self.account_ids:
+            self.account_ids.append(account_id)
+
+    def add_suspicious_activity(self, event: str) -> None:
+        self.suspicious_activity.append(event)
+        if not self.is_locked and self.status != ClientStatus.BLOCKED:
+            self.status = ClientStatus.SUSPICIOUS
+
+    def to_safe_dict(self) -> dict[str, object]:
+        return {
+            "client_id": self.client_id,
+            "full_name": self.full_name,
+            "email": Owner(self.full_name, self.email, self.phone).to_safe_dict()["email"],
+            "phone": Owner(self.full_name, self.email, self.phone).to_safe_dict()["phone"],
+            "status": self.status.value,
+            "account_ids": list(self.account_ids),
+        }
 
 
 class AbstractAccount(ABC):
@@ -439,3 +520,166 @@ class InvestmentAccount(BankAccount):
             f"portfolio_total={self._portfolio_total_value():.2f}"
             f")"
         )
+
+
+class Bank:
+    def __init__(self, name: str = "Bank") -> None:
+        self.name = Owner._validate_text(name, "name")
+        self.clients: dict[str, Client] = {}
+        self.accounts: dict[str, AbstractAccount] = {}
+        self.account_to_client: dict[str, str] = {}
+
+    @staticmethod
+    def _generate_short_id() -> str:
+        return uuid4().hex[:8]
+
+    def _generate_unique_account_id(self) -> str:
+        account_id = self._generate_short_id()
+        while account_id in self.accounts:
+            account_id = self._generate_short_id()
+        return account_id
+
+    def _get_client(self, client_id: str) -> Client:
+        normalized_client_id = Owner._validate_text(client_id, "client_id")
+        if normalized_client_id not in self.clients:
+            raise InvalidOperationError("client not found")
+        return self.clients[normalized_client_id]
+
+    def _get_account(self, account_id: str) -> AbstractAccount:
+        normalized_account_id = Owner._validate_text(account_id, "account_id")
+        if normalized_account_id not in self.accounts:
+            raise InvalidOperationError("account not found")
+        return self.accounts[normalized_account_id]
+
+    def _get_account_owner_client(self, account_id: str) -> Client:
+        normalized_account_id = Owner._validate_text(account_id, "account_id")
+        if normalized_account_id not in self.account_to_client:
+            raise InvalidOperationError("account not linked to client")
+        return self._get_client(self.account_to_client[normalized_account_id])
+
+    def _mark_suspicious(self, client: Client, event: str) -> None:
+        client.add_suspicious_activity(event)
+
+    def _current_hour(self) -> int:
+        return datetime.now().hour
+
+    def _ensure_operation_time_allowed(self, client: Client, action_name: str) -> None:
+        current_hour = self._current_hour()
+        if 0 <= current_hour < 5:
+            self._mark_suspicious(client, f"restricted hours operation: {action_name}")
+            raise InvalidOperationError("operations are not allowed from 00:00 to 05:00")
+
+    def add_client(self, client: Client) -> Client:
+        if not isinstance(client, Client):
+            raise InvalidOperationError("client must be a Client instance")
+        if client.client_id in self.clients:
+            raise InvalidOperationError("client_id must be unique")
+        self.clients[client.client_id] = client
+        return client
+
+    def open_account(self, client_id: str, account_type: str = "bank", **kwargs: object) -> AbstractAccount:
+        client = self._get_client(client_id)
+        self._ensure_operation_time_allowed(client, "open_account")
+        if client.is_locked:
+            self._mark_suspicious(client, "blocked client attempted to open account")
+            raise InvalidOperationError("blocked client cannot open account")
+        normalized_account_type = Owner._validate_text(account_type, "account_type").lower()
+        account_classes: dict[str, type[AbstractAccount]] = {
+            "bank": BankAccount,
+            "savings": SavingsAccount,
+            "premium": PremiumAccount,
+            "investment": InvestmentAccount,
+        }
+        if normalized_account_type not in account_classes:
+            raise InvalidOperationError("unsupported account type")
+        owner = Owner(client.full_name, client.email, client.phone)
+        account_kwargs = dict(kwargs)
+        account_kwargs["owner"] = owner
+        account_kwargs.setdefault("account_id", self._generate_unique_account_id())
+        account = account_classes[normalized_account_type](**account_kwargs)
+        self.accounts[account.account_id] = account
+        self.account_to_client[account.account_id] = client.client_id
+        client.add_account_id(account.account_id)
+        return account
+
+    def close_account(self, account_id: str) -> AccountStatus:
+        account = self._get_account(account_id)
+        client = self._get_account_owner_client(account_id)
+        self._ensure_operation_time_allowed(client, "close_account")
+        return account.close()
+
+    def freeze_account(self, account_id: str) -> AccountStatus:
+        account = self._get_account(account_id)
+        client = self._get_account_owner_client(account_id)
+        self._ensure_operation_time_allowed(client, "freeze_account")
+        return account.freeze()
+
+    def unfreeze_account(self, account_id: str) -> AccountStatus:
+        account = self._get_account(account_id)
+        client = self._get_account_owner_client(account_id)
+        self._ensure_operation_time_allowed(client, "unfreeze_account")
+        return account.activate()
+
+    def authenticate_client(self, client_id: str, pin_code: str) -> bool:
+        client = self._get_client(client_id)
+        if client.is_locked:
+            self._mark_suspicious(client, "authentication attempt on blocked client")
+            raise InvalidOperationError("client is blocked")
+        if client.pin_code != pin_code:
+            client.failed_auth_attempts += 1
+            if client.failed_auth_attempts >= 3:
+                client.is_locked = True
+                client.status = ClientStatus.BLOCKED
+                client.add_suspicious_activity("client locked after 3 failed authentication attempts")
+            raise InvalidOperationError("invalid credentials")
+        client.failed_auth_attempts = 0
+        return True
+
+    def search_accounts(
+        self,
+        client_id: str | None = None,
+        status: AccountStatus | str | None = None,
+        account_type: str | None = None,
+    ) -> list[AbstractAccount]:
+        matched_accounts = list(self.accounts.values())
+        if client_id is not None:
+            client = self._get_client(client_id)
+            matched_accounts = [account for account in matched_accounts if account.account_id in client.account_ids]
+        if status is not None:
+            normalized_status = AbstractAccount._coerce_status(status)
+            matched_accounts = [account for account in matched_accounts if account.status == normalized_status]
+        if account_type is not None:
+            normalized_account_type = Owner._validate_text(account_type, "account_type").lower()
+            matched_accounts = [
+                account for account in matched_accounts if account.__class__.__name__.lower() == f"{normalized_account_type}account"
+            ]
+        return matched_accounts
+
+    def get_total_balance(self) -> Decimal:
+        total_balance = Decimal("0.00")
+        for account in self.accounts.values():
+            total_balance += account.balance
+            if isinstance(account, InvestmentAccount):
+                total_balance += account._portfolio_total_value()
+        return total_balance.quantize(TWOPLACES, rounding=ROUND_HALF_UP)
+
+    def get_clients_ranking(self) -> list[dict[str, object]]:
+        ranking: list[dict[str, object]] = []
+        for client in self.clients.values():
+            total_assets = Decimal("0.00")
+            for account_id in client.account_ids:
+                account = self.accounts[account_id]
+                total_assets += account.balance
+                if isinstance(account, InvestmentAccount):
+                    total_assets += account._portfolio_total_value()
+            ranking.append(
+                {
+                    "client_id": client.client_id,
+                    "full_name": client.full_name,
+                    "status": client.status.value,
+                    "accounts_count": len(client.account_ids),
+                    "total_assets": f"{total_assets.quantize(TWOPLACES, rounding=ROUND_HALF_UP):.2f}",
+                }
+            )
+        ranking.sort(key=lambda item: Decimal(str(item["total_assets"])), reverse=True)
+        return ranking
