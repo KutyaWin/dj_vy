@@ -62,6 +62,13 @@ class Owner:
         email = cls._validate_text(value, "email")
         if "@" not in email:
             raise InvalidOperationError("email must contain '@'")
+        if email.count("@") != 1:
+            raise InvalidOperationError("email must contain exactly one '@'")
+        local_part, domain = email.split("@", 1)
+        if not local_part or not domain:
+            raise InvalidOperationError("email must contain both local part and domain")
+        if "." not in domain:
+            raise InvalidOperationError("email domain must contain '.'")
         return email
 
     def to_safe_dict(self) -> dict[str, str]:
