@@ -320,22 +320,39 @@ class BankManagerTestCase(unittest.TestCase):
         self.assertIsInstance(matched_accounts[0], InvestmentAccount)
 
     def test_get_total_balance_and_clients_ranking(self) -> None:
-        self.bank.open_account(self.client.client_id, account_type="bank", balance="100.00")
+        self.bank.open_account(self.client.client_id, account_type="bank", balance="100.00", currency="RUB")
         self.bank.open_account(
             self.client.client_id,
             account_type="investment",
             balance="50.00",
+            currency="USD",
             portfolio={"stocks": "250.00", "bonds": "100.00", "etf": "50.00"},
         )
-        self.bank.open_account(self.second_client.client_id, account_type="bank", balance="300.00")
+        self.bank.open_account(self.second_client.client_id, account_type="bank", balance="300.00", currency="USD")
+        self.bank.open_account(self.second_client.client_id, account_type="bank", balance="200.00", currency="RUB")
 
         total_balance = self.bank.get_total_balance()
         ranking = self.bank.get_clients_ranking()
 
-        self.assertEqual(total_balance, Decimal("850.00"))
-        self.assertEqual(ranking[0]["full_name"], "Anna Smirnova")
-        self.assertEqual(ranking[0]["total_assets"], "550.00")
-        self.assertEqual(ranking[1]["total_assets"], "300.00")
+        self.assertEqual(
+            total_balance,
+            {
+                "RUB": Decimal("300.00"),
+                "USD": Decimal("750.00"),
+                "EUR": Decimal("0.00"),
+                "KZT": Decimal("0.00"),
+                "CNY": Decimal("0.00"),
+            },
+        )
+        self.assertEqual(ranking["RUB"][0]["full_name"], "Boris Ivanov")
+        self.assertEqual(ranking["RUB"][0]["total_assets"], "200.00")
+        self.assertEqual(ranking["RUB"][1]["total_assets"], "100.00")
+        self.assertEqual(ranking["USD"][0]["full_name"], "Anna Smirnova")
+        self.assertEqual(ranking["USD"][0]["total_assets"], "450.00")
+        self.assertEqual(ranking["USD"][1]["total_assets"], "300.00")
+        self.assertEqual(ranking["EUR"], [])
+        self.assertEqual(ranking["KZT"], [])
+        self.assertEqual(ranking["CNY"], [])
 
 
 if __name__ == "__main__":

@@ -655,31 +655,52 @@ class Bank:
             ]
         return matched_accounts
 
-    def get_total_balance(self) -> Decimal:
-        total_balance = Decimal("0.00")
-        for account in self.accounts.values():
-            total_balance += account.balance
-            if isinstance(account, InvestmentAccount):
-                total_balance += account._portfolio_total_value()
-        return total_balance.quantize(TWOPLACES, rounding=ROUND_HALF_UP)
+    def _empty_balances_by_currency(self) -> dict[str, Decimal]:
+        return {currency.value: Decimal("0.00") for currency in Currency}
 
-    def get_clients_ranking(self) -> list[dict[str, object]]:
-        ranking: list[dict[str, object]] = []
+    def _account_total_assets(self, account: AbstractAccount) -> Decimal:
+        total_assets = account.balance
+        if isinstance(account, InvestmentAccount):
+            total_assets += account._portfolio_total_value()
+        return total_assets.quantize(TWOPLACES, rounding=ROUND_HALF_UP)
+
+    def get_total_balance(self) -> dict[str, Decimal]:
+        total_balance = self._empty_balances_by_currency()
+        for account in self.accounts.values():
+            total_balance[account.currency.value] += self._account_total_assets(account)
+        return {
+            currency_code: amount.quantize(TWOPLACES, rounding=ROUND_HALF_UP)
+            for currency_code, amount in total_balance.items()
+        }
+
+    def get_clients_ranking(self) -> dict[str, list[dict[str, object]]]:
+        ranking_by_currency: dict[str, list[dict[str, object]]] = {
+            currency.value: [] for currency in Currency
+        }
         for client in self.clients.values():
-            total_assets = Decimal("0.00")
+            client_assets_by_currency = self._empty_balances_by_currency()
+            accounts_count_by_currency = {currency.value: 0 for currency in Currency}
             for account_id in client.account_ids:
                 account = self.accounts[account_id]
-                total_assets += account.balance
-                if isinstance(account, InvestmentAccount):
-                    total_assets += account._portfolio_total_value()
-            ranking.append(
-                {
-                    "client_id": client.client_id,
-                    "full_name": client.full_name,
-                    "status": client.status.value,
-                    "accounts_count": len(client.account_ids),
-                    "total_assets": f"{total_assets.quantize(TWOPLACES, rounding=ROUND_HALF_UP):.2f}",
-                }
+                currency_code = account.currency.value
+                client_assets_by_currency[currency_code] += self._account_total_assets(account)
+                accounts_count_by_currency[currency_code] += 1
+            for currency_code, total_assets in client_assets_by_currency.items():
+                if accounts_count_by_currency[currency_code] == 0:
+                    continue
+                ranking_by_currency[currency_code].append(
+                    {
+                        "client_id": client.client_id,
+                        "full_name": client.full_name,
+                        "status": client.status.value,
+                        "accounts_count": accounts_count_by_currency[currency_code],
+                        "total_assets": f"{total_assets.quantize(TWOPLACES, rounding=ROUND_HALF_UP):.2f}",
+                    }
+                )
+        for currency_code in ranking_by_currency:
+            ranking_by_currency[currency_code].sort(
+                key=lambda item: Decimal(str(item["total_assets"])),
+                reverse=True,
             )
-        ranking.sort(key=lambda item: Decimal(str(item["total_assets"])), reverse=True)
-        return ranking
+        return ranking_by_currency
+
