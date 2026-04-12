@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from enum import Enum
 from uuid import uuid4
@@ -10,6 +10,18 @@ from uuid import uuid4
 
 TWOPLACES = Decimal("0.01")
 INVESTMENT_ASSET_TYPES = ("stocks", "bonds", "etf")
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _normalize_utc_datetime(value: datetime, field_name: str) -> datetime:
+    if not isinstance(value, datetime):
+        raise InvalidOperationError(f"{field_name} must be a datetime instance")
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
 
 
 class AccountStatus(Enum):
@@ -712,3 +724,402 @@ class Bank:
             )
         return ranking_by_currency
 
+
+class TransactionType(Enum):
+    TRANSFER_INTERNAL = "transfer_internal"
+    TRANSFER_EXTERNAL = "transfer_external"
+    EXCHANGE = "exchange"
+
+
+class TransactionStatus(Enum):
+    PENDING = "pending"
+    SCHEDULED = "scheduled"
+    PROCESSING = "processing"
+    RETRYING = "retrying"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+@dataclass
+class Transaction:
+    transaction_type: TransactionType | str
+    amount: Decimal | int | float | str
+    currency: Currency | str
+    sender_account_id: str
+    recipient_account_id: str
+    priority: int = 0
+    fee: Decimal | int | float | str = Decimal("0.00")
+    status: TransactionStatus | str = TransactionStatus.PENDING
+    failure_reason: str | None = None
+    created_at: datetime = field(default_factory=_utc_now)
+    updated_at: datetime = field(default_factory=_utc_now)
+    scheduled_at: datetime | None = None
+    processed_at: datetime | None = None
+    cancelled_at: datetime | None = None
+    failed_at: datetime | None = None
+    retry_count: int = 0
+    error_log: list[str] = field(default_factory=list)
+    transaction_id: str = field(default_factory=lambda: uuid4().hex[:12])
+
+    def __post_init__(self) -> None:
+        self.transaction_type = self._coerce_transaction_type(self.transaction_type)
+        self.amount = self._normalize_amount(self.amount)
+        self.currency = self._coerce_currency(self.currency)
+        self.sender_account_id = self._validate_identifier(self.sender_account_id, "sender_account_id")
+        self.recipient_account_id = self._validate_identifier(self.recipient_account_id, "recipient_account_id")
+        if self.sender_account_id == self.recipient_account_id:
+            raise InvalidOperationError("sender and recipient accounts must be different")
+        self.priority = self._coerce_priority(self.priority)
+        self.fee = self._normalize_amount(self.fee, allow_zero=True)
+        self.status = self._coerce_status(self.status)
+        self.transaction_id = self._validate_identifier(self.transaction_id, "transaction_id")
+        self.created_at = _normalize_utc_datetime(self.created_at, "created_at")
+        self.updated_at = _normalize_utc_datetime(self.updated_at, "updated_at")
+        if self.scheduled_at is not None:
+            self.scheduled_at = _normalize_utc_datetime(self.scheduled_at, "scheduled_at")
+        if self.processed_at is not None:
+            self.processed_at = _normalize_utc_datetime(self.processed_at, "processed_at")
+        if self.cancelled_at is not None:
+            self.cancelled_at = _normalize_utc_datetime(self.cancelled_at, "cancelled_at")
+        if self.failed_at is not None:
+            self.failed_at = _normalize_utc_datetime(self.failed_at, "failed_at")
+        if not isinstance(self.retry_count, int) or self.retry_count < 0:
+            raise InvalidOperationError("retry_count must be a non-negative integer")
+        if not isinstance(self.error_log, list):
+            raise InvalidOperationError("error_log must be a list")
+        if self.scheduled_at is not None and self.scheduled_at > self.created_at and self.status == TransactionStatus.PENDING:
+            self.status = TransactionStatus.SCHEDULED
+
+    @staticmethod
+    def _validate_identifier(value: str, field_name: str) -> str:
+        if not isinstance(value, str) or not value.strip():
+            raise InvalidOperationError(f"{field_name} must be a non-empty string")
+        return value.strip()
+
+    @staticmethod
+    def _coerce_priority(priority: int) -> int:
+        if not isinstance(priority, int) or isinstance(priority, bool):
+            raise InvalidOperationError("priority must be an integer")
+        return priority
+
+    @staticmethod
+    def _coerce_transaction_type(transaction_type: TransactionType | str) -> TransactionType:
+        if isinstance(transaction_type, TransactionType):
+            return transaction_type
+        if isinstance(transaction_type, str):
+            normalized_transaction_type = transaction_type.strip().lower()
+            for candidate in TransactionType:
+                if candidate.value == normalized_transaction_type:
+                    return candidate
+        raise InvalidOperationError("unsupported transaction type")
+
+    @staticmethod
+    def _coerce_status(status: TransactionStatus | str) -> TransactionStatus:
+        if isinstance(status, TransactionStatus):
+            return status
+        if isinstance(status, str):
+            normalized_status = status.strip().lower()
+            for candidate in TransactionStatus:
+                if candidate.value == normalized_status:
+                    return candidate
+        raise InvalidOperationError("unsupported transaction status")
+
+    @staticmethod
+    def _coerce_currency(currency: Currency | str) -> Currency:
+        if isinstance(currency, Currency):
+            return currency
+        if isinstance(currency, str):
+            normalized_currency = currency.strip().upper()
+            for candidate in Currency:
+                if candidate.value == normalized_currency:
+                    return candidate
+        raise InvalidOperationError("unsupported currency")
+
+    @staticmethod
+    def _normalize_amount(
+        amount: Decimal | int | float | str,
+        allow_zero: bool = False,
+    ) -> Decimal:
+        try:
+            normalized_amount = Decimal(str(amount)).quantize(TWOPLACES, rounding=ROUND_HALF_UP)
+        except (InvalidOperation, ValueError):
+            raise InvalidOperationError("amount must be a valid number") from None
+        if allow_zero:
+            if normalized_amount < 0:
+                raise InvalidOperationError("amount cannot be negative")
+            return normalized_amount
+        if normalized_amount <= 0:
+            raise InvalidOperationError("amount must be greater than zero")
+        return normalized_amount
+
+    def add_error(self, message: str, occurred_at: datetime | None = None) -> None:
+        normalized_message = self._validate_identifier(message, "message")
+        self.error_log.append(normalized_message)
+        self.updated_at = _utc_now() if occurred_at is None else _normalize_utc_datetime(occurred_at, "occurred_at")
+
+    def mark_processing(self, occurred_at: datetime | None = None) -> None:
+        self.status = TransactionStatus.PROCESSING
+        self.updated_at = _utc_now() if occurred_at is None else _normalize_utc_datetime(occurred_at, "occurred_at")
+
+    def mark_completed(self, occurred_at: datetime | None = None) -> None:
+        timestamp = _utc_now() if occurred_at is None else _normalize_utc_datetime(occurred_at, "occurred_at")
+        self.status = TransactionStatus.COMPLETED
+        self.failure_reason = None
+        self.processed_at = timestamp
+        self.updated_at = timestamp
+
+    def mark_failed(self, reason: str, occurred_at: datetime | None = None) -> None:
+        timestamp = _utc_now() if occurred_at is None else _normalize_utc_datetime(occurred_at, "occurred_at")
+        self.failure_reason = self._validate_identifier(reason, "reason")
+        self.status = TransactionStatus.FAILED
+        self.failed_at = timestamp
+        self.updated_at = timestamp
+        self.add_error(self.failure_reason, timestamp)
+
+    def mark_cancelled(self, reason: str, occurred_at: datetime | None = None) -> None:
+        timestamp = _utc_now() if occurred_at is None else _normalize_utc_datetime(occurred_at, "occurred_at")
+        self.failure_reason = self._validate_identifier(reason, "reason")
+        self.status = TransactionStatus.CANCELLED
+        self.cancelled_at = timestamp
+        self.updated_at = timestamp
+
+    def mark_retrying(self, reason: str, occurred_at: datetime | None = None) -> None:
+        timestamp = _utc_now() if occurred_at is None else _normalize_utc_datetime(occurred_at, "occurred_at")
+        self.failure_reason = self._validate_identifier(reason, "reason")
+        self.status = TransactionStatus.RETRYING
+        self.retry_count += 1
+        self.updated_at = timestamp
+        self.add_error(self.failure_reason, timestamp)
+
+
+class TransactionQueue:
+    def __init__(self) -> None:
+        self._transactions: dict[str, Transaction] = {}
+        self._sequence_by_id: dict[str, int] = {}
+        self._sequence = 0
+
+    def add_transaction(self, transaction: Transaction) -> Transaction:
+        if not isinstance(transaction, Transaction):
+            raise InvalidOperationError("transaction must be a Transaction instance")
+        if transaction.transaction_id in self._transactions:
+            raise InvalidOperationError("transaction_id must be unique")
+        now = _utc_now()
+        if transaction.scheduled_at is not None and transaction.scheduled_at > now:
+            transaction.status = TransactionStatus.SCHEDULED
+        elif transaction.status == TransactionStatus.SCHEDULED:
+            transaction.status = TransactionStatus.PENDING
+        transaction.updated_at = now
+        self._transactions[transaction.transaction_id] = transaction
+        self._sequence_by_id[transaction.transaction_id] = self._sequence
+        self._sequence += 1
+        return transaction
+
+    def get_transaction(self, transaction_id: str) -> Transaction:
+        normalized_transaction_id = Transaction._validate_identifier(transaction_id, "transaction_id")
+        if normalized_transaction_id not in self._transactions:
+            raise InvalidOperationError("transaction not found")
+        return self._transactions[normalized_transaction_id]
+
+    def list_transactions(self) -> list[Transaction]:
+        return sorted(
+            self._transactions.values(),
+            key=lambda transaction: self._sequence_by_id[transaction.transaction_id],
+        )
+
+    def cancel_transaction(self, transaction_id: str, reason: str = "cancelled by user") -> Transaction:
+        transaction = self.get_transaction(transaction_id)
+        if transaction.status in {
+            TransactionStatus.PROCESSING,
+            TransactionStatus.COMPLETED,
+            TransactionStatus.FAILED,
+            TransactionStatus.CANCELLED,
+        }:
+            raise InvalidOperationError("transaction cannot be cancelled")
+        transaction.mark_cancelled(reason)
+        return transaction
+
+    def get_ready_transactions(self, now: datetime | None = None) -> list[Transaction]:
+        current_time = _utc_now() if now is None else _normalize_utc_datetime(now, "now")
+        ready_transactions = [
+            transaction
+            for transaction in self._transactions.values()
+            if transaction.status in {TransactionStatus.PENDING, TransactionStatus.RETRYING}
+            or (
+                transaction.status == TransactionStatus.SCHEDULED
+                and transaction.scheduled_at is not None
+                and transaction.scheduled_at <= current_time
+            )
+        ]
+        return sorted(
+            ready_transactions,
+            key=lambda transaction: (
+                -transaction.priority,
+                self._sequence_by_id[transaction.transaction_id],
+            ),
+        )
+
+
+class TransactionProcessor:
+    def __init__(
+        self,
+        bank: Bank,
+        exchange_rates: dict[tuple[str, str], Decimal | int | float | str] | None = None,
+        external_transfer_fee: Decimal | int | float | str = Decimal("10.00"),
+        max_retries: int = 3,
+    ) -> None:
+        if not isinstance(bank, Bank):
+            raise InvalidOperationError("bank must be a Bank instance")
+        if not isinstance(max_retries, int) or max_retries < 0:
+            raise InvalidOperationError("max_retries must be a non-negative integer")
+        self.bank = bank
+        self.max_retries = max_retries
+        self.external_transfer_fee = Transaction._normalize_amount(external_transfer_fee, allow_zero=True)
+        self.exchange_rates = self._normalize_exchange_rates(exchange_rates or {})
+
+    def _normalize_exchange_rates(
+        self,
+        exchange_rates: dict[tuple[str, str], Decimal | int | float | str],
+    ) -> dict[tuple[str, str], Decimal]:
+        normalized_rates: dict[tuple[str, str], Decimal] = {}
+        for currency_pair, rate in exchange_rates.items():
+            if not isinstance(currency_pair, tuple) or len(currency_pair) != 2:
+                raise InvalidOperationError("exchange rate key must be a pair of currency codes")
+            source_currency = Transaction._coerce_currency(currency_pair[0]).value
+            target_currency = Transaction._coerce_currency(currency_pair[1]).value
+            normalized_rate = Transaction._normalize_amount(rate)
+            normalized_rates[(source_currency, target_currency)] = normalized_rate
+        return normalized_rates
+
+    def _get_exchange_rate(self, source_currency: Currency, target_currency: Currency) -> Decimal:
+        if source_currency == target_currency:
+            return Decimal("1.00")
+        direct_pair = (source_currency.value, target_currency.value)
+        if direct_pair in self.exchange_rates:
+            return self.exchange_rates[direct_pair]
+        reverse_pair = (target_currency.value, source_currency.value)
+        if reverse_pair in self.exchange_rates:
+            reverse_rate = self.exchange_rates[reverse_pair]
+            return (Decimal("1.00") / reverse_rate).quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
+        raise InvalidOperationError("exchange rate not found")
+
+    def _convert_amount(self, amount: Decimal, source_currency: Currency, target_currency: Currency) -> Decimal:
+        exchange_rate = self._get_exchange_rate(source_currency, target_currency)
+        return (amount * exchange_rate).quantize(TWOPLACES, rounding=ROUND_HALF_UP)
+
+    def _ensure_account_can_transact(self, account_id: str, role: str) -> None:
+        account = self.bank._get_account(account_id)
+        if account.status == AccountStatus.FROZEN:
+            raise AccountFrozenError(f"{role} account is frozen")
+        if account.status == AccountStatus.CLOSED:
+            raise AccountClosedError(f"{role} account is closed")
+
+    def _ensure_sender_client_can_transact(self, account_id: str) -> None:
+        client = self.bank._get_account_owner_client(account_id)
+        if client.is_locked or client.status == ClientStatus.BLOCKED:
+            raise InvalidOperationError("blocked client cannot initiate transaction")
+
+    def _validate_transaction_type(self, transaction: Transaction) -> tuple[str, str, bool]:
+        sender_client_id = self.bank.account_to_client[transaction.sender_account_id]
+        recipient_client_id = self.bank.account_to_client[transaction.recipient_account_id]
+        same_client = sender_client_id == recipient_client_id
+        sender_account = self.bank._get_account(transaction.sender_account_id)
+        recipient_account = self.bank._get_account(transaction.recipient_account_id)
+        if transaction.transaction_type == TransactionType.TRANSFER_INTERNAL:
+            if not same_client:
+                raise InvalidOperationError("internal transfer requires accounts of the same client")
+            if sender_account.currency != recipient_account.currency:
+                raise InvalidOperationError("internal transfer requires matching account currencies")
+        if transaction.transaction_type == TransactionType.TRANSFER_EXTERNAL and same_client:
+            raise InvalidOperationError("external transfer requires accounts of different clients")
+        if transaction.transaction_type == TransactionType.EXCHANGE:
+            if not same_client:
+                raise InvalidOperationError("exchange requires accounts of the same client")
+            if sender_account.currency == recipient_account.currency:
+                raise InvalidOperationError("exchange requires different account currencies")
+        return sender_client_id, recipient_client_id, same_client
+
+    def _calculate_fee(self, same_client: bool) -> Decimal:
+        if same_client:
+            return Decimal("0.00")
+        return self.external_transfer_fee.quantize(TWOPLACES, rounding=ROUND_HALF_UP)
+
+    def _execute_transaction(self, transaction: Transaction) -> None:
+        sender_account = self.bank._get_account(transaction.sender_account_id)
+        recipient_account = self.bank._get_account(transaction.recipient_account_id)
+        self._ensure_account_can_transact(sender_account.account_id, "sender")
+        self._ensure_account_can_transact(recipient_account.account_id, "recipient")
+        self._ensure_sender_client_can_transact(sender_account.account_id)
+        _, _, same_client = self._validate_transaction_type(transaction)
+        if transaction.currency != sender_account.currency:
+            raise InvalidOperationError("transaction currency must match sender account currency")
+        transaction.fee = self._calculate_fee(same_client)
+        recipient_amount = self._convert_amount(transaction.amount, sender_account.currency, recipient_account.currency)
+        total_sender_charge = (transaction.amount + transaction.fee).quantize(TWOPLACES, rounding=ROUND_HALF_UP)
+        sender_account.withdraw(total_sender_charge)
+        recipient_account.deposit(recipient_amount)
+
+    def process_transaction(self, transaction: Transaction, now: datetime | None = None) -> Transaction:
+        if not isinstance(transaction, Transaction):
+            raise InvalidOperationError("transaction must be a Transaction instance")
+        current_time = _utc_now() if now is None else _normalize_utc_datetime(now, "now")
+        if transaction.status in {TransactionStatus.COMPLETED, TransactionStatus.CANCELLED, TransactionStatus.FAILED}:
+            return transaction
+        if transaction.scheduled_at is not None and transaction.scheduled_at > current_time:
+            transaction.status = TransactionStatus.SCHEDULED
+            transaction.updated_at = current_time
+            return transaction
+        transaction.mark_processing(current_time)
+        try:
+            self._execute_transaction(transaction)
+        except (InvalidOperationError, AccountFrozenError, AccountClosedError, InsufficientFundsError) as exc:
+            transaction.mark_failed(str(exc), current_time)
+            return transaction
+        except Exception as exc:
+            if transaction.retry_count < self.max_retries:
+                transaction.mark_retrying(str(exc), current_time)
+                return transaction
+            transaction.mark_failed(str(exc), current_time)
+            return transaction
+        transaction.mark_completed(current_time)
+        return transaction
+
+    def process_queue(
+        self,
+        transaction_queue: TransactionQueue,
+        now: datetime | None = None,
+        limit: int | None = None,
+    ) -> list[Transaction]:
+        if not isinstance(transaction_queue, TransactionQueue):
+            raise InvalidOperationError("transaction_queue must be a TransactionQueue instance")
+        ready_transactions = transaction_queue.get_ready_transactions(now)
+        if limit is not None:
+            if not isinstance(limit, int) or limit <= 0:
+                raise InvalidOperationError("limit must be a positive integer")
+            ready_transactions = ready_transactions[:limit]
+        processed_transactions: list[Transaction] = []
+        for transaction in ready_transactions:
+            processed_transactions.append(self.process_transaction(transaction, now))
+        return processed_transactions
+
+    def process_until_idle(
+        self,
+        transaction_queue: TransactionQueue,
+        now: datetime | None = None,
+        max_cycles: int | None = None,
+    ) -> list[Transaction]:
+        if max_cycles is not None and (not isinstance(max_cycles, int) or max_cycles <= 0):
+            raise InvalidOperationError("max_cycles must be a positive integer")
+        processed_transactions: list[Transaction] = []
+        current_cycle = 0
+        while True:
+            current_cycle += 1
+            if max_cycles is not None and current_cycle > max_cycles:
+                break
+            batch = self.process_queue(transaction_queue, now)
+            if not batch:
+                break
+            processed_transactions.extend(batch)
+            if all(transaction.status != TransactionStatus.RETRYING for transaction in batch):
+                break
+        return processed_transactions

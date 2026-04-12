@@ -1,4 +1,5 @@
 
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 import unittest
 from unittest.mock import patch
@@ -18,6 +19,11 @@ from src.models import (
     Owner,
     PremiumAccount,
     SavingsAccount,
+    Transaction,
+    TransactionProcessor,
+    TransactionQueue,
+    TransactionStatus,
+    TransactionType,
 )
 
 
@@ -401,6 +407,359 @@ class BankManagerTestCase(unittest.TestCase):
         self.assertEqual(ranking["EUR"], [])
         self.assertEqual(ranking["KZT"], [])
         self.assertEqual(ranking["CNY"], [])
+
+
+class TransactionQueueTestCase(unittest.TestCase):
+    def test_transaction_uses_timezone_aware_utc_timestamps(self) -> None:
+        transaction = Transaction(
+            transaction_type=TransactionType.TRANSFER_EXTERNAL,
+            amount="10.00",
+            currency="RUB",
+            sender_account_id="ACC10001",
+            recipient_account_id="ACC20001",
+        )
+
+        self.assertIsNotNone(transaction.created_at.tzinfo)
+        self.assertEqual(transaction.created_at.tzinfo, timezone.utc)
+        self.assertIsNotNone(transaction.updated_at.tzinfo)
+        self.assertEqual(transaction.updated_at.tzinfo, timezone.utc)
+
+    def test_queue_orders_ready_transactions_by_priority_and_respects_schedule(self) -> None:
+        queue = TransactionQueue()
+        now = datetime.now(timezone.utc)
+        low_priority_transaction = Transaction(
+            transaction_type=TransactionType.TRANSFER_EXTERNAL,
+            amount="10.00",
+            currency="RUB",
+            sender_account_id="ACC10001",
+            recipient_account_id="ACC20001",
+            priority=1,
+        )
+        high_priority_transaction = Transaction(
+            transaction_type=TransactionType.TRANSFER_EXTERNAL,
+            amount="20.00",
+            currency="RUB",
+            sender_account_id="ACC10002",
+            recipient_account_id="ACC20002",
+            priority=5,
+        )
+        delayed_transaction = Transaction(
+            transaction_type=TransactionType.TRANSFER_EXTERNAL,
+            amount="30.00",
+            currency="RUB",
+            sender_account_id="ACC10003",
+            recipient_account_id="ACC20003",
+            priority=10,
+            scheduled_at=now + timedelta(hours=1),
+        )
+
+        queue.add_transaction(low_priority_transaction)
+        queue.add_transaction(high_priority_transaction)
+        queue.add_transaction(delayed_transaction)
+
+        ready_transactions = queue.get_ready_transactions(now)
+
+        self.assertEqual(
+            [transaction.transaction_id for transaction in ready_transactions],
+            [high_priority_transaction.transaction_id, low_priority_transaction.transaction_id],
+        )
+        self.assertEqual(delayed_transaction.status, TransactionStatus.SCHEDULED)
+
+    def test_queue_cancels_pending_transaction(self) -> None:
+        queue = TransactionQueue()
+        transaction = Transaction(
+            transaction_type=TransactionType.TRANSFER_INTERNAL,
+            amount="15.00",
+            currency="USD",
+            sender_account_id="ACC30001",
+            recipient_account_id="ACC30002",
+        )
+
+        queue.add_transaction(transaction)
+        cancelled_transaction = queue.cancel_transaction(transaction.transaction_id, "user request")
+
+        self.assertEqual(cancelled_transaction.status, TransactionStatus.CANCELLED)
+        self.assertEqual(cancelled_transaction.failure_reason, "user request")
+
+
+class TransactionProcessorTestCase(unittest.TestCase):
+    def setUp(self) -> None:
+        self.bank = Bank(name="Transaction Bank")
+        self.first_client = Client(
+            full_name="Anna Smirnova",
+            email="anna.smirnova@example.com",
+            phone="+77005554433",
+            age=28,
+            pin_code="1234",
+        )
+        self.second_client = Client(
+            full_name="Boris Ivanov",
+            email="boris.ivanov@example.com",
+            phone="+77009998877",
+            age=35,
+            pin_code="5678",
+        )
+        self.third_client = Client(
+            full_name="Clara Kim",
+            email="clara.kim@example.com",
+            phone="+77007778899",
+            age=31,
+            pin_code="1111",
+        )
+        self.bank.add_client(self.first_client)
+        self.bank.add_client(self.second_client)
+        self.bank.add_client(self.third_client)
+        self.first_rub = self.bank.open_account(
+            self.first_client.client_id,
+            account_type="bank",
+            balance="1000.00",
+            currency="RUB",
+            account_id="A_RUB_01",
+        )
+        self.first_usd = self.bank.open_account(
+            self.first_client.client_id,
+            account_type="bank",
+            balance="200.00",
+            currency="USD",
+            account_id="A_USD_01",
+        )
+        self.second_rub = self.bank.open_account(
+            self.second_client.client_id,
+            account_type="bank",
+            balance="300.00",
+            currency="RUB",
+            account_id="B_RUB_01",
+        )
+        self.second_usd = self.bank.open_account(
+            self.second_client.client_id,
+            account_type="bank",
+            balance="50.00",
+            currency="USD",
+            account_id="B_USD_01",
+        )
+        self.third_premium = self.bank.open_account(
+            self.third_client.client_id,
+            account_type="premium",
+            balance="20.00",
+            currency="RUB",
+            overdraft_limit="200.00",
+            fixed_commission="0.00",
+            single_withdrawal_limit="500.00",
+            account_id="C_PRM_01",
+        )
+        self.processor = TransactionProcessor(
+            self.bank,
+            exchange_rates={
+                ("RUB", "USD"): "0.01",
+                ("USD", "RUB"): "100.00",
+                ("EUR", "USD"): "1.10",
+            },
+            external_transfer_fee="10.00",
+            max_retries=3,
+        )
+
+    def test_processor_handles_external_fee_and_currency_conversion(self) -> None:
+        transaction = Transaction(
+            transaction_type=TransactionType.TRANSFER_EXTERNAL,
+            amount="100.00",
+            currency="RUB",
+            sender_account_id=self.first_rub.account_id,
+            recipient_account_id=self.second_usd.account_id,
+        )
+
+        processed_transaction = self.processor.process_transaction(transaction)
+
+        self.assertEqual(processed_transaction.status, TransactionStatus.COMPLETED)
+        self.assertEqual(processed_transaction.fee, Decimal("10.00"))
+        self.assertEqual(self.first_rub.balance, Decimal("890.00"))
+        self.assertEqual(self.second_usd.balance, Decimal("51.00"))
+
+    def test_processor_rejects_frozen_account_transactions(self) -> None:
+        self.second_rub.freeze()
+        transaction = Transaction(
+            transaction_type=TransactionType.TRANSFER_EXTERNAL,
+            amount="20.00",
+            currency="RUB",
+            sender_account_id=self.first_rub.account_id,
+            recipient_account_id=self.second_rub.account_id,
+        )
+
+        processed_transaction = self.processor.process_transaction(transaction)
+
+        self.assertEqual(processed_transaction.status, TransactionStatus.FAILED)
+        self.assertEqual(processed_transaction.failure_reason, "recipient account is frozen")
+        self.assertEqual(self.first_rub.balance, Decimal("1000.00"))
+        self.assertEqual(self.second_rub.balance, Decimal("300.00"))
+
+    def test_processor_allows_premium_overdraft_for_external_transfer(self) -> None:
+        transaction = Transaction(
+            transaction_type=TransactionType.TRANSFER_EXTERNAL,
+            amount="100.00",
+            currency="RUB",
+            sender_account_id=self.third_premium.account_id,
+            recipient_account_id=self.second_rub.account_id,
+        )
+
+        processed_transaction = self.processor.process_transaction(transaction)
+
+        self.assertEqual(processed_transaction.status, TransactionStatus.COMPLETED)
+        self.assertEqual(self.third_premium.balance, Decimal("-90.00"))
+        self.assertEqual(self.second_rub.balance, Decimal("400.00"))
+
+    def test_processor_marks_retrying_for_temporary_errors(self) -> None:
+        transaction = Transaction(
+            transaction_type=TransactionType.TRANSFER_INTERNAL,
+            amount="10.00",
+            currency="RUB",
+            sender_account_id=self.first_rub.account_id,
+            recipient_account_id=self.second_rub.account_id,
+        )
+
+        with patch.object(self.processor, "_execute_transaction", side_effect=RuntimeError("temporary processor error")):
+            processed_transaction = self.processor.process_transaction(transaction)
+
+        self.assertEqual(processed_transaction.status, TransactionStatus.RETRYING)
+        self.assertEqual(processed_transaction.retry_count, 1)
+        self.assertIn("temporary processor error", processed_transaction.error_log)
+
+    def test_process_queue_executes_ten_transactions(self) -> None:
+        queue = TransactionQueue()
+        now = datetime.now(timezone.utc)
+        transactions = [
+            Transaction(
+                transaction_type=TransactionType.TRANSFER_INTERNAL,
+                amount="50.00",
+                currency="RUB",
+                sender_account_id=self.first_rub.account_id,
+                recipient_account_id=self.second_rub.account_id,
+                priority=8,
+            ),
+            Transaction(
+                transaction_type=TransactionType.TRANSFER_EXTERNAL,
+                amount="200.00",
+                currency="RUB",
+                sender_account_id=self.first_rub.account_id,
+                recipient_account_id=self.second_rub.account_id,
+                priority=7,
+            ),
+            Transaction(
+                transaction_type=TransactionType.EXCHANGE,
+                amount="100.00",
+                currency="RUB",
+                sender_account_id=self.first_rub.account_id,
+                recipient_account_id=self.first_usd.account_id,
+                priority=9,
+            ),
+            Transaction(
+                transaction_type=TransactionType.TRANSFER_EXTERNAL,
+                amount="30.00",
+                currency="USD",
+                sender_account_id=self.first_usd.account_id,
+                recipient_account_id=self.second_usd.account_id,
+                priority=6,
+            ),
+            Transaction(
+                transaction_type=TransactionType.TRANSFER_EXTERNAL,
+                amount="40.00",
+                currency="RUB",
+                sender_account_id=self.first_rub.account_id,
+                recipient_account_id=self.third_premium.account_id,
+                priority=5,
+            ),
+            Transaction(
+                transaction_type=TransactionType.TRANSFER_INTERNAL,
+                amount="60.00",
+                currency="USD",
+                sender_account_id=self.first_usd.account_id,
+                recipient_account_id=self.first_rub.account_id,
+                priority=4,
+            ),
+            Transaction(
+                transaction_type=TransactionType.TRANSFER_EXTERNAL,
+                amount="150.00",
+                currency="RUB",
+                sender_account_id=self.third_premium.account_id,
+                recipient_account_id=self.second_rub.account_id,
+                priority=3,
+            ),
+            Transaction(
+                transaction_type=TransactionType.TRANSFER_EXTERNAL,
+                amount="5000.00",
+                currency="RUB",
+                sender_account_id=self.first_rub.account_id,
+                recipient_account_id=self.second_rub.account_id,
+                priority=2,
+            ),
+            Transaction(
+                transaction_type=TransactionType.TRANSFER_EXTERNAL,
+                amount="25.00",
+                currency="RUB",
+                sender_account_id=self.first_rub.account_id,
+                recipient_account_id=self.second_rub.account_id,
+                priority=10,
+                scheduled_at=now + timedelta(minutes=30),
+            ),
+            Transaction(
+                transaction_type=TransactionType.TRANSFER_EXTERNAL,
+                amount="15.00",
+                currency="RUB",
+                sender_account_id=self.first_rub.account_id,
+                recipient_account_id=self.second_rub.account_id,
+                priority=1,
+            ),
+        ]
+        cancelled_transaction = transactions[9]
+
+        for transaction in transactions:
+            queue.add_transaction(transaction)
+
+        queue.cancel_transaction(cancelled_transaction.transaction_id, "user cancelled before execution")
+        self.second_usd.freeze()
+
+        processed_before_schedule = self.processor.process_until_idle(queue, now)
+
+        self.assertEqual(len(processed_before_schedule), 8)
+        self.assertEqual(transactions[0].status, TransactionStatus.FAILED)
+        self.assertEqual(transactions[1].status, TransactionStatus.COMPLETED)
+        self.assertEqual(transactions[2].status, TransactionStatus.COMPLETED)
+        self.assertEqual(transactions[3].status, TransactionStatus.FAILED)
+        self.assertEqual(transactions[4].status, TransactionStatus.COMPLETED)
+        self.assertEqual(transactions[5].status, TransactionStatus.FAILED)
+        self.assertEqual(transactions[6].status, TransactionStatus.COMPLETED)
+        self.assertEqual(transactions[7].status, TransactionStatus.FAILED)
+        self.assertEqual(transactions[8].status, TransactionStatus.SCHEDULED)
+        self.assertEqual(transactions[9].status, TransactionStatus.CANCELLED)
+        self.assertEqual(transactions[0].failure_reason, "internal transfer requires accounts of the same client")
+        self.assertEqual(transactions[3].failure_reason, "recipient account is frozen")
+        self.assertEqual(transactions[5].failure_reason, "internal transfer requires matching account currencies")
+        self.assertEqual(transactions[7].failure_reason, "insufficient funds")
+
+        self.second_usd.activate()
+        processed_after_schedule = self.processor.process_until_idle(queue, now + timedelta(hours=1))
+
+        self.assertEqual(len(processed_after_schedule), 1)
+        self.assertEqual(transactions[8].status, TransactionStatus.COMPLETED)
+        self.assertEqual(self.first_rub.balance, Decimal("605.00"))
+        self.assertEqual(self.first_usd.balance, Decimal("201.00"))
+        self.assertEqual(self.second_rub.balance, Decimal("675.00"))
+        self.assertEqual(self.second_usd.balance, Decimal("50.00"))
+        self.assertEqual(self.third_premium.balance, Decimal("-100.00"))
+
+    def test_cancel_completed_transaction_is_not_allowed(self) -> None:
+        queue = TransactionQueue()
+        transaction = Transaction(
+            transaction_type=TransactionType.TRANSFER_EXTERNAL,
+            amount="20.00",
+            currency="RUB",
+            sender_account_id=self.first_rub.account_id,
+            recipient_account_id=self.second_rub.account_id,
+        )
+
+        queue.add_transaction(transaction)
+        self.processor.process_transaction(transaction)
+
+        with self.assertRaises(InvalidOperationError):
+            queue.cancel_transaction(transaction.transaction_id)
 
 
 if __name__ == "__main__":
