@@ -569,6 +569,11 @@ class Bank:
             self._mark_suspicious(client, f"restricted hours operation: {action_name}")
             raise InvalidOperationError("operations are not allowed from 00:00 to 05:00")
 
+    def _ensure_client_is_not_blocked(self, client: Client, action_name: str) -> None:
+        if client.is_locked or client.status == ClientStatus.BLOCKED:
+            self._mark_suspicious(client, f"blocked client attempted to {action_name}")
+            raise InvalidOperationError(f"blocked client cannot {action_name.replace('_', ' ')}")
+
     def add_client(self, client: Client) -> Client:
         if not isinstance(client, Client):
             raise InvalidOperationError("client must be a Client instance")
@@ -580,9 +585,7 @@ class Bank:
     def open_account(self, client_id: str, account_type: str = "bank", **kwargs: object) -> AbstractAccount:
         client = self._get_client(client_id)
         self._ensure_operation_time_allowed(client, "open_account")
-        if client.is_locked:
-            self._mark_suspicious(client, "blocked client attempted to open account")
-            raise InvalidOperationError("blocked client cannot open account")
+        self._ensure_client_is_not_blocked(client, "open_account")
         normalized_account_type = Owner._validate_text(account_type, "account_type").lower()
         account_classes: dict[str, type[AbstractAccount]] = {
             "bank": BankAccount,
@@ -595,7 +598,9 @@ class Bank:
         owner = Owner(client.full_name, client.email, client.phone)
         account_kwargs = dict(kwargs)
         account_kwargs["owner"] = owner
-        account_kwargs.setdefault("account_id", self._generate_unique_account_id())
+        provided_account_id = account_kwargs.get("account_id")
+        if provided_account_id is None or Owner._validate_text(str(provided_account_id), "account_id") in self.accounts:
+            account_kwargs["account_id"] = self._generate_unique_account_id()
         account = account_classes[normalized_account_type](**account_kwargs)
         self.accounts[account.account_id] = account
         self.account_to_client[account.account_id] = client.client_id
@@ -606,18 +611,21 @@ class Bank:
         account = self._get_account(account_id)
         client = self._get_account_owner_client(account_id)
         self._ensure_operation_time_allowed(client, "close_account")
+        self._ensure_client_is_not_blocked(client, "close_account")
         return account.close()
 
     def freeze_account(self, account_id: str) -> AccountStatus:
         account = self._get_account(account_id)
         client = self._get_account_owner_client(account_id)
         self._ensure_operation_time_allowed(client, "freeze_account")
+        self._ensure_client_is_not_blocked(client, "freeze_account")
         return account.freeze()
 
     def unfreeze_account(self, account_id: str) -> AccountStatus:
         account = self._get_account(account_id)
         client = self._get_account_owner_client(account_id)
         self._ensure_operation_time_allowed(client, "unfreeze_account")
+        self._ensure_client_is_not_blocked(client, "unfreeze_account")
         return account.activate()
 
     def authenticate_client(self, client_id: str, pin_code: str) -> bool:

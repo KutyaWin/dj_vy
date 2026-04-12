@@ -278,6 +278,30 @@ class BankManagerTestCase(unittest.TestCase):
         self.assertIsInstance(savings_account, SavingsAccount)
         self.assertEqual(len(self.client.account_ids), 2)
 
+    def test_open_account_regenerates_duplicate_account_id(self) -> None:
+        first_account = self.bank.open_account(
+            self.client.client_id,
+            account_type="bank",
+            balance="100.00",
+            account_id="DUPL1234",
+        )
+
+        second_account = self.bank.open_account(
+            self.second_client.client_id,
+            account_type="bank",
+            balance="200.00",
+            account_id="DUPL1234",
+        )
+
+        self.assertEqual(first_account.account_id, "DUPL1234")
+        self.assertNotEqual(second_account.account_id, "DUPL1234")
+        self.assertIn(first_account.account_id, self.bank.accounts)
+        self.assertIn(second_account.account_id, self.bank.accounts)
+        self.assertIs(self.bank.accounts[first_account.account_id], first_account)
+        self.assertIs(self.bank.accounts[second_account.account_id], second_account)
+        self.assertEqual(self.bank.account_to_client[first_account.account_id], self.client.client_id)
+        self.assertEqual(self.bank.account_to_client[second_account.account_id], self.second_client.client_id)
+
     def test_authenticate_client_locks_after_three_failed_attempts(self) -> None:
         with self.assertRaises(InvalidOperationError):
             self.bank.authenticate_client(self.client.client_id, "9999")
@@ -300,6 +324,30 @@ class BankManagerTestCase(unittest.TestCase):
         self.assertEqual(self.bank.freeze_account(account.account_id), AccountStatus.FROZEN)
         self.assertEqual(self.bank.unfreeze_account(account.account_id), AccountStatus.ACTIVE)
         self.assertEqual(self.bank.close_account(account.account_id), AccountStatus.CLOSED)
+
+    def test_blocked_client_cannot_manage_account_state(self) -> None:
+        account = self.bank.open_account(self.client.client_id, account_type="premium", balance="400.00")
+
+        for _ in range(3):
+            with self.assertRaises(InvalidOperationError):
+                self.bank.authenticate_client(self.client.client_id, "9999")
+
+        with self.assertRaises(InvalidOperationError):
+            self.bank.freeze_account(account.account_id)
+
+        self.assertEqual(account.status, AccountStatus.ACTIVE)
+
+        account.freeze()
+
+        with self.assertRaises(InvalidOperationError):
+            self.bank.unfreeze_account(account.account_id)
+
+        self.assertEqual(account.status, AccountStatus.FROZEN)
+
+        with self.assertRaises(InvalidOperationError):
+            self.bank.close_account(account.account_id)
+
+        self.assertEqual(account.status, AccountStatus.FROZEN)
 
     def test_restricted_hours_block_operations_and_mark_suspicious(self) -> None:
         with patch.object(Bank, "_current_hour", return_value=1):
