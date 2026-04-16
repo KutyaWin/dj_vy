@@ -2,9 +2,11 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from enum import Enum
+import json
+from pathlib import Path
 from uuid import uuid4
 
 
@@ -534,12 +536,270 @@ class InvestmentAccount(BankAccount):
         )
 
 
+class AuditSeverity(Enum):
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+
+
+class RiskLevel(Enum):
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+
+
+@dataclass
+class AuditEvent:
+    severity: AuditSeverity | str
+    event_type: str
+    message: str
+    client_id: str | None = None
+    account_id: str | None = None
+    transaction_id: str | None = None
+    risk_level: RiskLevel | str | None = None
+    metadata: dict[str, object] = field(default_factory=dict)
+    timestamp: datetime = field(default_factory=_utc_now)
+    event_id: str = field(default_factory=lambda: uuid4().hex[:12])
+
+    def __post_init__(self) -> None:
+        self.severity = self._coerce_severity(self.severity)
+        self.event_type = Owner._validate_text(self.event_type, "event_type")
+        self.message = Owner._validate_text(self.message, "message")
+        self.timestamp = _normalize_utc_datetime(self.timestamp, "timestamp")
+        self.event_id = Owner._validate_text(self.event_id, "event_id")
+        if self.client_id is not None:
+            self.client_id = Owner._validate_text(self.client_id, "client_id")
+        if self.account_id is not None:
+            self.account_id = Owner._validate_text(self.account_id, "account_id")
+        if self.transaction_id is not None:
+            self.transaction_id = Owner._validate_text(self.transaction_id, "transaction_id")
+        if self.risk_level is not None:
+            self.risk_level = self._coerce_risk_level(self.risk_level)
+        if not isinstance(self.metadata, dict):
+            raise InvalidOperationError("metadata must be a dictionary")
+
+    @staticmethod
+    def _coerce_severity(severity: AuditSeverity | str) -> AuditSeverity:
+        if isinstance(severity, AuditSeverity):
+            return severity
+        if isinstance(severity, str):
+            normalized_severity = severity.strip().lower()
+            for candidate in AuditSeverity:
+                if candidate.value == normalized_severity:
+                    return candidate
+        raise InvalidOperationError("unsupported audit severity")
+
+    @staticmethod
+    def _coerce_risk_level(risk_level: RiskLevel | str) -> RiskLevel:
+        if isinstance(risk_level, RiskLevel):
+            return risk_level
+        if isinstance(risk_level, str):
+            normalized_risk_level = risk_level.strip().lower()
+            for candidate in RiskLevel:
+                if candidate.value == normalized_risk_level:
+                    return candidate
+        raise InvalidOperationError("unsupported risk level")
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "event_id": self.event_id,
+            "timestamp": self.timestamp.isoformat(),
+            "severity": self.severity.value,
+            "event_type": self.event_type,
+            "client_id": self.client_id,
+            "account_id": self.account_id,
+            "transaction_id": self.transaction_id,
+            "risk_level": self.risk_level.value if self.risk_level is not None else None,
+            "message": self.message,
+            "metadata": self.metadata,
+        }
+
+
+class AuditLog:
+    def __init__(self, file_path: str | None = None) -> None:
+        if file_path is not None and (not isinstance(file_path, str) or not file_path.strip()):
+            raise InvalidOperationError("file_path must be a non-empty string")
+        self.file_path = file_path.strip() if isinstance(file_path, str) else None
+        self._events: list[AuditEvent] = []
+
+    @property
+    def events(self) -> list[AuditEvent]:
+        return list(self._events)
+
+    def log_event(
+        self,
+        severity: AuditSeverity | str,
+        event_type: str,
+        message: str,
+        client_id: str | None = None,
+        account_id: str | None = None,
+        transaction_id: str | None = None,
+        risk_level: RiskLevel | str | None = None,
+        metadata: dict[str, object] | None = None,
+        timestamp: datetime | None = None,
+    ) -> AuditEvent:
+        event = AuditEvent(
+            severity=severity,
+            event_type=event_type,
+            message=message,
+            client_id=client_id,
+            account_id=account_id,
+            transaction_id=transaction_id,
+            risk_level=risk_level,
+            metadata=dict(metadata or {}),
+            timestamp=_utc_now() if timestamp is None else _normalize_utc_datetime(timestamp, "timestamp"),
+        )
+        self._events.append(event)
+        if self.file_path is not None:
+            path = Path(self.file_path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as file:
+                file.write(json.dumps(event.to_dict(), ensure_ascii=False) + "\n")
+        return event
+
+    def filter_events(
+        self,
+        severity: AuditSeverity | str | None = None,
+        event_type: str | None = None,
+        client_id: str | None = None,
+        transaction_id: str | None = None,
+        risk_level: RiskLevel | str | None = None,
+    ) -> list[AuditEvent]:
+        normalized_severity = AuditEvent._coerce_severity(severity) if severity is not None else None
+        normalized_event_type = Owner._validate_text(event_type, "event_type") if event_type is not None else None
+        normalized_client_id = Owner._validate_text(client_id, "client_id") if client_id is not None else None
+        normalized_transaction_id = (
+            Owner._validate_text(transaction_id, "transaction_id") if transaction_id is not None else None
+        )
+        normalized_risk_level = AuditEvent._coerce_risk_level(risk_level) if risk_level is not None else None
+        filtered_events = self._events
+        if normalized_severity is not None:
+            filtered_events = [event for event in filtered_events if event.severity == normalized_severity]
+        if normalized_event_type is not None:
+            filtered_events = [event for event in filtered_events if event.event_type == normalized_event_type]
+        if normalized_client_id is not None:
+            filtered_events = [event for event in filtered_events if event.client_id == normalized_client_id]
+        if normalized_transaction_id is not None:
+            filtered_events = [event for event in filtered_events if event.transaction_id == normalized_transaction_id]
+        if normalized_risk_level is not None:
+            filtered_events = [event for event in filtered_events if event.risk_level == normalized_risk_level]
+        return list(filtered_events)
+
+    def get_suspicious_events(self, min_risk_level: RiskLevel | str = RiskLevel.MEDIUM) -> list[AuditEvent]:
+        normalized_min_risk_level = AuditEvent._coerce_risk_level(min_risk_level)
+        risk_order = {RiskLevel.LOW: 1, RiskLevel.MEDIUM: 2, RiskLevel.HIGH: 3}
+        return [
+            event
+            for event in self._events
+            if event.risk_level is not None and risk_order[event.risk_level] >= risk_order[normalized_min_risk_level]
+        ]
+
+    def get_error_statistics(self) -> dict[str, int]:
+        statistics: dict[str, int] = {}
+        for event in self._events:
+            if event.event_type not in {"transaction_failed", "transaction_blocked", "operation_error"}:
+                continue
+            statistics[event.message] = statistics.get(event.message, 0) + 1
+        return statistics
+
+
+@dataclass
+class RiskAssessment:
+    risk_level: RiskLevel | str
+    reasons: list[str] = field(default_factory=list)
+    should_block: bool = False
+    score: int = 0
+
+    def __post_init__(self) -> None:
+        self.risk_level = AuditEvent._coerce_risk_level(self.risk_level)
+        if not isinstance(self.reasons, list) or any(not isinstance(reason, str) or not reason.strip() for reason in self.reasons):
+            raise InvalidOperationError("reasons must be a list of non-empty strings")
+        if not isinstance(self.should_block, bool):
+            raise InvalidOperationError("should_block must be a boolean")
+        if not isinstance(self.score, int) or self.score < 0:
+            raise InvalidOperationError("score must be a non-negative integer")
+
+
+class RiskAnalyzer:
+    def __init__(
+        self,
+        large_amount_threshold: Decimal | int | float | str = Decimal("1000.00"),
+        frequent_operations_threshold: int = 3,
+        frequent_operations_window_minutes: int = 10,
+        block_level: RiskLevel | str = RiskLevel.HIGH,
+    ) -> None:
+        self.large_amount_threshold = Transaction._normalize_amount(large_amount_threshold)
+        if not isinstance(frequent_operations_threshold, int) or frequent_operations_threshold <= 0:
+            raise InvalidOperationError("frequent_operations_threshold must be a positive integer")
+        if not isinstance(frequent_operations_window_minutes, int) or frequent_operations_window_minutes <= 0:
+            raise InvalidOperationError("frequent_operations_window_minutes must be a positive integer")
+        self.frequent_operations_threshold = frequent_operations_threshold
+        self.frequent_operations_window_minutes = frequent_operations_window_minutes
+        self.block_level = AuditEvent._coerce_risk_level(block_level)
+
+    def _risk_from_score(self, score: int) -> RiskLevel:
+        if score >= 4:
+            return RiskLevel.HIGH
+        if score >= 2:
+            return RiskLevel.MEDIUM
+        return RiskLevel.LOW
+
+    def _should_block(self, risk_level: RiskLevel) -> bool:
+        risk_order = {RiskLevel.LOW: 1, RiskLevel.MEDIUM: 2, RiskLevel.HIGH: 3}
+        return risk_order[risk_level] >= risk_order[self.block_level]
+
+    def analyze_transaction(self, transaction: Transaction, bank: Bank, current_time: datetime) -> RiskAssessment:
+        if not isinstance(transaction, Transaction):
+            raise InvalidOperationError("transaction must be a Transaction instance")
+        if not isinstance(bank, Bank):
+            raise InvalidOperationError("bank must be a Bank instance")
+        normalized_current_time = _normalize_utc_datetime(current_time, "current_time")
+        sender_client = bank._get_account_owner_client(transaction.sender_account_id)
+        reasons: list[str] = []
+        score = 0
+        if transaction.amount >= self.large_amount_threshold:
+            reasons.append("large amount")
+            score += 2
+        recent_events = [
+            event
+            for event in bank.audit_log.events
+            if event.client_id == sender_client.client_id
+            and event.event_type in {"transaction_completed", "transaction_failed", "transaction_blocked"}
+            and event.timestamp >= normalized_current_time - timedelta(minutes=self.frequent_operations_window_minutes)
+        ]
+        if len(recent_events) >= self.frequent_operations_threshold:
+            reasons.append("frequent operations")
+            score += 1
+        known_recipient_events = [
+            event
+            for event in bank.audit_log.events
+            if event.client_id == sender_client.client_id
+            and event.metadata.get("recipient_account_id") == transaction.recipient_account_id
+            and event.event_type in {"transaction_completed", "transaction_blocked", "transaction_failed"}
+        ]
+        if not known_recipient_events:
+            reasons.append("transfer to a new account")
+            score += 1
+        if 0 <= normalized_current_time.hour < 5:
+            reasons.append("night operation")
+            score += 2
+        risk_level = self._risk_from_score(score)
+        return RiskAssessment(
+            risk_level=risk_level,
+            reasons=reasons,
+            should_block=self._should_block(risk_level),
+            score=score,
+        )
+
+
 class Bank:
-    def __init__(self, name: str = "Bank") -> None:
+    def __init__(self, name: str = "Bank", audit_log_file_path: str | None = None) -> None:
         self.name = Owner._validate_text(name, "name")
         self.clients: dict[str, Client] = {}
         self.accounts: dict[str, AbstractAccount] = {}
         self.account_to_client: dict[str, str] = {}
+        self.audit_log = AuditLog(file_path=audit_log_file_path)
+        self.risk_analyzer = RiskAnalyzer()
 
     @staticmethod
     def _generate_short_id() -> str:
@@ -571,6 +831,37 @@ class Bank:
 
     def _mark_suspicious(self, client: Client, event: str) -> None:
         client.add_suspicious_activity(event)
+        self.audit_log.log_event(
+            severity=AuditSeverity.MEDIUM,
+            event_type="suspicious_activity",
+            message=event,
+            client_id=client.client_id,
+            metadata={"client_status": client.status.value},
+        )
+
+    def log_audit_event(
+        self,
+        severity: AuditSeverity | str,
+        event_type: str,
+        message: str,
+        client_id: str | None = None,
+        account_id: str | None = None,
+        transaction_id: str | None = None,
+        risk_level: RiskLevel | str | None = None,
+        metadata: dict[str, object] | None = None,
+        timestamp: datetime | None = None,
+    ) -> AuditEvent:
+        return self.audit_log.log_event(
+            severity=severity,
+            event_type=event_type,
+            message=message,
+            client_id=client_id,
+            account_id=account_id,
+            transaction_id=transaction_id,
+            risk_level=risk_level,
+            metadata=metadata,
+            timestamp=timestamp,
+        )
 
     def _current_hour(self, current_time: datetime | None = None) -> int:
         if current_time is None:
@@ -599,6 +890,12 @@ class Bank:
         if client.client_id in self.clients:
             raise InvalidOperationError("client_id must be unique")
         self.clients[client.client_id] = client
+        self.log_audit_event(
+            severity=AuditSeverity.LOW,
+            event_type="client_added",
+            message="client added to bank",
+            client_id=client.client_id,
+        )
         return client
 
     def open_account(self, client_id: str, account_type: str = "bank", **kwargs: object) -> AbstractAccount:
@@ -730,6 +1027,42 @@ class Bank:
                 reverse=True,
             )
         return ranking_by_currency
+
+    def get_audit_report_suspicious_operations(
+        self,
+        min_risk_level: RiskLevel | str = RiskLevel.MEDIUM,
+    ) -> list[dict[str, object]]:
+        return [event.to_dict() for event in self.audit_log.get_suspicious_events(min_risk_level)]
+
+    def get_client_risk_profile(self, client_id: str) -> dict[str, object]:
+        client = self._get_client(client_id)
+        client_events = self.audit_log.filter_events(client_id=client.client_id)
+        risk_events = [event for event in client_events if event.risk_level is not None]
+        blocked_operations = [event for event in client_events if event.event_type == "transaction_blocked"]
+        risk_order = {RiskLevel.LOW: 1, RiskLevel.MEDIUM: 2, RiskLevel.HIGH: 3}
+        highest_risk = RiskLevel.LOW
+        for event in risk_events:
+            if event.risk_level is not None and risk_order[event.risk_level] > risk_order[highest_risk]:
+                highest_risk = event.risk_level
+        recent_risky_recipients = sorted(
+            {
+                str(event.metadata.get("recipient_account_id"))
+                for event in risk_events
+                if event.metadata.get("recipient_account_id") is not None
+            }
+        )
+        return {
+            "client_id": client.client_id,
+            "client_status": client.status.value,
+            "highest_risk": highest_risk.value,
+            "suspicious_events_count": len([event for event in client_events if event.event_type == "suspicious_activity"]),
+            "blocked_operations_count": len(blocked_operations),
+            "total_risk_events": len(risk_events),
+            "recent_risky_recipients": recent_risky_recipients,
+        }
+
+    def get_audit_error_statistics(self) -> dict[str, int]:
+        return self.audit_log.get_error_statistics()
 
 
 class TransactionType(Enum):
@@ -1056,6 +1389,49 @@ class TransactionProcessor:
         action_name = f"transaction_{transaction.transaction_type.value}"
         self.bank._ensure_operation_time_allowed(sender_client, action_name, current_time)
 
+    @staticmethod
+    def _risk_severity_for_level(risk_level: RiskLevel) -> AuditSeverity:
+        if risk_level == RiskLevel.HIGH:
+            return AuditSeverity.HIGH
+        if risk_level == RiskLevel.MEDIUM:
+            return AuditSeverity.MEDIUM
+        return AuditSeverity.LOW
+
+    def _build_audit_metadata(self, transaction: Transaction, risk_assessment: RiskAssessment | None = None) -> dict[str, object]:
+        metadata: dict[str, object] = {
+            "transaction_type": transaction.transaction_type.value,
+            "amount": f"{transaction.amount:.2f}",
+            "currency": transaction.currency.value,
+            "sender_account_id": transaction.sender_account_id,
+            "recipient_account_id": transaction.recipient_account_id,
+            "fee": f"{transaction.fee:.2f}",
+        }
+        if risk_assessment is not None:
+            metadata["risk_reasons"] = list(risk_assessment.reasons)
+            metadata["risk_score"] = risk_assessment.score
+        return metadata
+
+    def _log_risk_assessment(
+        self,
+        transaction: Transaction,
+        client_id: str,
+        risk_assessment: RiskAssessment,
+        current_time: datetime,
+    ) -> None:
+        if not risk_assessment.reasons:
+            return
+        self.bank.log_audit_event(
+            severity=self._risk_severity_for_level(risk_assessment.risk_level),
+            event_type="risk_assessment",
+            message=", ".join(risk_assessment.reasons),
+            client_id=client_id,
+            account_id=transaction.sender_account_id,
+            transaction_id=transaction.transaction_id,
+            risk_level=risk_assessment.risk_level,
+            metadata=self._build_audit_metadata(transaction, risk_assessment),
+            timestamp=current_time,
+        )
+
     def _execute_transaction(self, transaction: Transaction) -> None:
         sender_account = self.bank._get_account(transaction.sender_account_id)
         recipient_account = self.bank._get_account(transaction.recipient_account_id)
@@ -1081,19 +1457,71 @@ class TransactionProcessor:
             transaction.status = TransactionStatus.SCHEDULED
             transaction.updated_at = current_time
             return transaction
+        sender_client = self.bank._get_account_owner_client(transaction.sender_account_id)
+        risk_assessment = self.bank.risk_analyzer.analyze_transaction(transaction, self.bank, current_time)
+        self._log_risk_assessment(transaction, sender_client.client_id, risk_assessment, current_time)
         try:
+            if risk_assessment.should_block:
+                reason = "operation blocked by risk analyzer"
+                self.bank._mark_suspicious(sender_client, f"risk blocked operation: {transaction.transaction_type.value}")
+                self.bank.log_audit_event(
+                    severity=self._risk_severity_for_level(risk_assessment.risk_level),
+                    event_type="transaction_blocked",
+                    message=reason,
+                    client_id=sender_client.client_id,
+                    account_id=transaction.sender_account_id,
+                    transaction_id=transaction.transaction_id,
+                    risk_level=risk_assessment.risk_level,
+                    metadata=self._build_audit_metadata(transaction, risk_assessment),
+                    timestamp=current_time,
+                )
+                raise InvalidOperationError(reason)
             self._ensure_transaction_time_allowed(transaction, current_time)
             transaction.mark_processing(current_time)
             self._execute_transaction(transaction)
         except (InvalidOperationError, AccountFrozenError, AccountClosedError, InsufficientFundsError) as exc:
+            if not risk_assessment.should_block:
+                self.bank.log_audit_event(
+                    severity=AuditSeverity.MEDIUM,
+                    event_type="transaction_failed",
+                    message=str(exc),
+                    client_id=sender_client.client_id,
+                    account_id=transaction.sender_account_id,
+                    transaction_id=transaction.transaction_id,
+                    risk_level=risk_assessment.risk_level if risk_assessment.reasons else None,
+                    metadata=self._build_audit_metadata(transaction, risk_assessment),
+                    timestamp=current_time,
+                )
             transaction.mark_failed(str(exc), current_time)
             return transaction
         except Exception as exc:
+            self.bank.log_audit_event(
+                severity=AuditSeverity.HIGH,
+                event_type="operation_error",
+                message=str(exc),
+                client_id=sender_client.client_id,
+                account_id=transaction.sender_account_id,
+                transaction_id=transaction.transaction_id,
+                risk_level=risk_assessment.risk_level if risk_assessment.reasons else None,
+                metadata=self._build_audit_metadata(transaction, risk_assessment),
+                timestamp=current_time,
+            )
             if transaction.retry_count < self.max_retries:
                 transaction.mark_retrying(str(exc), current_time)
                 return transaction
             transaction.mark_failed(str(exc), current_time)
             return transaction
+        self.bank.log_audit_event(
+            severity=AuditSeverity.LOW,
+            event_type="transaction_completed",
+            message="transaction completed successfully",
+            client_id=sender_client.client_id,
+            account_id=transaction.sender_account_id,
+            transaction_id=transaction.transaction_id,
+            risk_level=risk_assessment.risk_level if risk_assessment.reasons else None,
+            metadata=self._build_audit_metadata(transaction, risk_assessment),
+            timestamp=current_time,
+        )
         transaction.mark_completed(current_time)
         return transaction
 

@@ -1,6 +1,8 @@
 
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+import json
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -18,6 +20,7 @@ from src.models import (
     InvalidOperationError,
     Owner,
     PremiumAccount,
+    RiskLevel,
     SavingsAccount,
     Transaction,
     TransactionProcessor,
@@ -484,7 +487,9 @@ class TransactionQueueTestCase(unittest.TestCase):
 
 class TransactionProcessorTestCase(unittest.TestCase):
     def setUp(self) -> None:
-        self.bank = Bank(name="Transaction Bank")
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.audit_log_file_path = f"{self.temp_dir.name}/audit.jsonl"
+        self.bank = Bank(name="Transaction Bank", audit_log_file_path=self.audit_log_file_path)
         self.first_client = Client(
             full_name="Anna Smirnova",
             email="anna.smirnova@example.com",
@@ -557,6 +562,105 @@ class TransactionProcessorTestCase(unittest.TestCase):
             external_transfer_fee="10.00",
             max_retries=3,
         )
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    def test_audit_log_persists_events_in_memory_and_file(self) -> None:
+        transaction = Transaction(
+            transaction_type=TransactionType.TRANSFER_EXTERNAL,
+            amount="100.00",
+            currency="RUB",
+            sender_account_id=self.first_rub.account_id,
+            recipient_account_id=self.second_usd.account_id,
+        )
+
+        self.processor.process_transaction(transaction)
+
+        risk_events = self.bank.audit_log.filter_events(
+            event_type="risk_assessment",
+            transaction_id=transaction.transaction_id,
+        )
+        completed_events = self.bank.audit_log.filter_events(
+            event_type="transaction_completed",
+            transaction_id=transaction.transaction_id,
+        )
+        self.assertEqual(len(risk_events), 1)
+        self.assertEqual(len(completed_events), 1)
+        with open(self.audit_log_file_path, encoding="utf-8") as file:
+            lines = [json.loads(line) for line in file if line.strip()]
+        self.assertGreaterEqual(len(lines), 1)
+        self.assertTrue(any(line["transaction_id"] == transaction.transaction_id for line in lines))
+
+    def test_audit_report_and_risk_profile_include_blocked_operation(self) -> None:
+        self.bank.risk_analyzer.large_amount_threshold = Decimal("5000.00")
+        blocked_time = datetime(2026, 4, 16, 1, 10, tzinfo=timezone.utc)
+        transaction = Transaction(
+            transaction_type=TransactionType.TRANSFER_EXTERNAL,
+            amount="6000.00",
+            currency="RUB",
+            sender_account_id=self.first_rub.account_id,
+            recipient_account_id=self.second_rub.account_id,
+        )
+
+        processed_transaction = self.processor.process_transaction(transaction, now=blocked_time)
+
+        self.assertEqual(processed_transaction.status, TransactionStatus.FAILED)
+        suspicious_report = self.bank.get_audit_report_suspicious_operations(RiskLevel.MEDIUM)
+        self.assertTrue(any(event["transaction_id"] == transaction.transaction_id for event in suspicious_report))
+        risk_profile = self.bank.get_client_risk_profile(self.first_client.client_id)
+        self.assertEqual(risk_profile["highest_risk"], RiskLevel.HIGH.value)
+        self.assertGreaterEqual(risk_profile["blocked_operations_count"], 1)
+        self.assertIn(self.second_rub.account_id, risk_profile["recent_risky_recipients"])
+
+    def test_audit_error_statistics_count_blocked_and_failed_operations(self) -> None:
+        self.bank.risk_analyzer.large_amount_threshold = Decimal("2000.00")
+        blocked_time = datetime(2026, 4, 16, 2, 0, tzinfo=timezone.utc)
+        blocked_transaction = Transaction(
+            transaction_type=TransactionType.TRANSFER_EXTERNAL,
+            amount="2500.00",
+            currency="RUB",
+            sender_account_id=self.first_rub.account_id,
+            recipient_account_id=self.second_rub.account_id,
+        )
+        failed_transaction = Transaction(
+            transaction_type=TransactionType.TRANSFER_EXTERNAL,
+            amount="20.00",
+            currency="RUB",
+            sender_account_id=self.first_rub.account_id,
+            recipient_account_id=self.second_rub.account_id,
+        )
+        self.second_rub.freeze()
+
+        self.processor.process_transaction(blocked_transaction, now=blocked_time)
+        self.processor.process_transaction(failed_transaction, now=datetime(2026, 4, 16, 8, 0, tzinfo=timezone.utc))
+
+        error_statistics = self.bank.get_audit_error_statistics()
+        self.assertEqual(error_statistics["operation blocked by risk analyzer"], 1)
+        self.assertEqual(error_statistics["recipient account is frozen"], 1)
+
+    def test_risk_analyzer_blocks_high_risk_transaction(self) -> None:
+        self.bank.risk_analyzer.large_amount_threshold = Decimal("5000.00")
+        high_risk_time = datetime(2026, 4, 16, 1, 0, tzinfo=timezone.utc)
+        transaction = Transaction(
+            transaction_type=TransactionType.TRANSFER_EXTERNAL,
+            amount="7000.00",
+            currency="RUB",
+            sender_account_id=self.first_rub.account_id,
+            recipient_account_id=self.second_rub.account_id,
+        )
+
+        processed_transaction = self.processor.process_transaction(transaction, now=high_risk_time)
+
+        self.assertEqual(processed_transaction.status, TransactionStatus.FAILED)
+        self.assertEqual(processed_transaction.failure_reason, "operation blocked by risk analyzer")
+        blocked_events = self.bank.audit_log.filter_events(
+            event_type="transaction_blocked",
+            transaction_id=transaction.transaction_id,
+        )
+        self.assertEqual(len(blocked_events), 1)
+        self.assertEqual(blocked_events[0].risk_level, RiskLevel.HIGH)
+        self.assertEqual(self.first_client.status, ClientStatus.SUSPICIOUS)
 
     def test_processor_handles_external_fee_and_currency_conversion(self) -> None:
         transaction = Transaction(
