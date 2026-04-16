@@ -622,6 +622,53 @@ class TransactionProcessorTestCase(unittest.TestCase):
         self.assertEqual(processed_transaction.retry_count, 1)
         self.assertIn("temporary processor error", processed_transaction.error_log)
 
+    def test_processor_blocks_transactions_during_restricted_hours_and_marks_sender_suspicious(self) -> None:
+        restricted_time = datetime(2026, 4, 16, 1, 30, tzinfo=timezone.utc)
+        transaction = Transaction(
+            transaction_type=TransactionType.TRANSFER_EXTERNAL,
+            amount="100.00",
+            currency="RUB",
+            sender_account_id=self.first_rub.account_id,
+            recipient_account_id=self.second_rub.account_id,
+        )
+
+        processed_transaction = self.processor.process_transaction(transaction, now=restricted_time)
+
+        self.assertEqual(processed_transaction.status, TransactionStatus.FAILED)
+        self.assertEqual(processed_transaction.failure_reason, "operations are not allowed from 00:00 to 05:00")
+        self.assertEqual(self.first_rub.balance, Decimal("1000.00"))
+        self.assertEqual(self.second_rub.balance, Decimal("300.00"))
+        self.assertEqual(self.first_client.status, ClientStatus.SUSPICIOUS)
+        self.assertIn(
+            "restricted hours operation: transaction_transfer_external",
+            self.first_client.suspicious_activity,
+        )
+
+    def test_scheduled_transaction_fails_if_execution_time_is_restricted(self) -> None:
+        queue = TransactionQueue()
+        scheduled_time = datetime(2026, 4, 17, 1, 0, tzinfo=timezone.utc)
+        transaction = Transaction(
+            transaction_type=TransactionType.TRANSFER_EXTERNAL,
+            amount="50.00",
+            currency="RUB",
+            sender_account_id=self.first_rub.account_id,
+            recipient_account_id=self.second_rub.account_id,
+            scheduled_at=scheduled_time,
+        )
+
+        queue.add_transaction(transaction)
+        processed_transactions = self.processor.process_until_idle(queue, now=scheduled_time)
+
+        self.assertEqual(len(processed_transactions), 1)
+        self.assertEqual(transaction.status, TransactionStatus.FAILED)
+        self.assertEqual(transaction.failure_reason, "operations are not allowed from 00:00 to 05:00")
+        self.assertEqual(self.first_rub.balance, Decimal("1000.00"))
+        self.assertEqual(self.second_rub.balance, Decimal("300.00"))
+        self.assertIn(
+            "restricted hours operation: transaction_transfer_external",
+            self.first_client.suspicious_activity,
+        )
+
     def test_process_queue_executes_ten_transactions(self) -> None:
         queue = TransactionQueue()
         now = datetime.now(timezone.utc)

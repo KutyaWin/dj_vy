@@ -572,11 +572,18 @@ class Bank:
     def _mark_suspicious(self, client: Client, event: str) -> None:
         client.add_suspicious_activity(event)
 
-    def _current_hour(self) -> int:
-        return datetime.now().hour
+    def _current_hour(self, current_time: datetime | None = None) -> int:
+        if current_time is None:
+            return datetime.now().hour
+        return current_time.hour
 
-    def _ensure_operation_time_allowed(self, client: Client, action_name: str) -> None:
-        current_hour = self._current_hour()
+    def _ensure_operation_time_allowed(
+        self,
+        client: Client,
+        action_name: str,
+        current_time: datetime | None = None,
+    ) -> None:
+        current_hour = self._current_hour(current_time)
         if 0 <= current_hour < 5:
             self._mark_suspicious(client, f"restricted hours operation: {action_name}")
             raise InvalidOperationError("operations are not allowed from 00:00 to 05:00")
@@ -1044,6 +1051,11 @@ class TransactionProcessor:
             return Decimal("0.00")
         return self.external_transfer_fee.quantize(TWOPLACES, rounding=ROUND_HALF_UP)
 
+    def _ensure_transaction_time_allowed(self, transaction: Transaction, current_time: datetime) -> None:
+        sender_client = self.bank._get_account_owner_client(transaction.sender_account_id)
+        action_name = f"transaction_{transaction.transaction_type.value}"
+        self.bank._ensure_operation_time_allowed(sender_client, action_name, current_time)
+
     def _execute_transaction(self, transaction: Transaction) -> None:
         sender_account = self.bank._get_account(transaction.sender_account_id)
         recipient_account = self.bank._get_account(transaction.recipient_account_id)
@@ -1069,8 +1081,9 @@ class TransactionProcessor:
             transaction.status = TransactionStatus.SCHEDULED
             transaction.updated_at = current_time
             return transaction
-        transaction.mark_processing(current_time)
         try:
+            self._ensure_transaction_time_allowed(transaction, current_time)
+            transaction.mark_processing(current_time)
             self._execute_transaction(transaction)
         except (InvalidOperationError, AccountFrozenError, AccountClosedError, InsufficientFundsError) as exc:
             transaction.mark_failed(str(exc), current_time)
