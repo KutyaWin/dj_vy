@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+import csv
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
@@ -1065,6 +1066,451 @@ class Bank:
         return self.audit_log.get_error_statistics()
 
 
+class ReportType(Enum):
+    CLIENT = "client"
+    BANK = "bank"
+    RISK = "risk"
+
+
+class ReportBuilder:
+    def __init__(self, bank: Bank) -> None:
+        if not isinstance(bank, Bank):
+            raise InvalidOperationError("bank must be a Bank instance")
+        self.bank = bank
+
+    def _validate_path(self, path_value: str, field_name: str) -> Path:
+        if not isinstance(path_value, str) or not path_value.strip():
+            raise InvalidOperationError(f"{field_name} must be a non-empty string")
+        return Path(path_value.strip())
+
+    def _serialize_for_export(self, value: object) -> object:
+        if isinstance(value, Decimal):
+            return f"{value.quantize(TWOPLACES, rounding=ROUND_HALF_UP):.2f}"
+        if isinstance(value, datetime):
+            return value.isoformat()
+        if isinstance(value, Enum):
+            return value.value
+        if isinstance(value, dict):
+            return {str(key): self._serialize_for_export(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [self._serialize_for_export(item) for item in value]
+        if isinstance(value, tuple):
+            return [self._serialize_for_export(item) for item in value]
+        return value
+
+    def _flatten_report_data(self, value: object, prefix: str = "") -> list[tuple[str, str]]:
+        serialized_value = self._serialize_for_export(value)
+        if isinstance(serialized_value, dict):
+            flattened_rows: list[tuple[str, str]] = []
+            for key, item in serialized_value.items():
+                next_prefix = f"{prefix}.{key}" if prefix else str(key)
+                flattened_rows.extend(self._flatten_report_data(item, next_prefix))
+            return flattened_rows
+        if isinstance(serialized_value, list):
+            flattened_rows = []
+            for index, item in enumerate(serialized_value):
+                next_prefix = f"{prefix}[{index}]" if prefix else f"[{index}]"
+                flattened_rows.extend(self._flatten_report_data(item, next_prefix))
+            return flattened_rows
+        return [(prefix or "value", "" if serialized_value is None else str(serialized_value))]
+
+    def _build_client_assets_by_currency(self, client: Client) -> dict[str, str]:
+        balances = self.bank._empty_balances_by_currency()
+        for account_id in client.account_ids:
+            account = self.bank.accounts[account_id]
+            balances[account.currency.value] += self.bank._account_total_assets(account)
+        return {
+            currency_code: f"{amount.quantize(TWOPLACES, rounding=ROUND_HALF_UP):.2f}"
+            for currency_code, amount in balances.items()
+            if amount > 0
+        }
+
+    @staticmethod
+    def _event_type_to_transaction_status(event_type: str) -> str:
+        if event_type == "transaction_completed":
+            return TransactionStatus.COMPLETED.value
+        if event_type in {"transaction_failed", "transaction_blocked"}:
+            return TransactionStatus.FAILED.value
+        if event_type == "risk_assessment":
+            return TransactionStatus.PENDING.value
+        return event_type
+
+    def _build_transaction_summaries(self) -> list[dict[str, object]]:
+        summaries_by_id: dict[str, dict[str, object]] = {}
+        for event in self.bank.audit_log.events:
+            if event.transaction_id is None:
+                continue
+            metadata = event.metadata
+            sender_account_id = metadata.get("sender_account_id")
+            recipient_account_id = metadata.get("recipient_account_id")
+            sender_client_id = None
+            recipient_client_id = None
+            if isinstance(sender_account_id, str) and sender_account_id in self.bank.account_to_client:
+                sender_client_id = self.bank.account_to_client[sender_account_id]
+            if isinstance(recipient_account_id, str) and recipient_account_id in self.bank.account_to_client:
+                recipient_client_id = self.bank.account_to_client[recipient_account_id]
+            summary = summaries_by_id.setdefault(
+                event.transaction_id,
+                {
+                    "transaction_id": event.transaction_id,
+                    "client_id": sender_client_id or event.client_id,
+                    "sender_client_id": sender_client_id,
+                    "recipient_client_id": recipient_client_id,
+                    "sender_account_id": sender_account_id,
+                    "recipient_account_id": recipient_account_id,
+                    "transaction_type": metadata.get("transaction_type"),
+                    "amount": metadata.get("amount"),
+                    "currency": metadata.get("currency"),
+                    "risk_level": None,
+                    "latest_event_type": event.event_type,
+                    "status": self._event_type_to_transaction_status(event.event_type),
+                    "message": event.message,
+                    "last_updated": event.timestamp.isoformat(),
+                },
+            )
+            summary["latest_event_type"] = event.event_type
+            summary["status"] = self._event_type_to_transaction_status(event.event_type)
+            summary["message"] = event.message
+            summary["last_updated"] = event.timestamp.isoformat()
+            if event.risk_level is not None:
+                summary["risk_level"] = event.risk_level.value
+            if summary["transaction_type"] is None:
+                summary["transaction_type"] = metadata.get("transaction_type")
+            if summary["amount"] is None:
+                summary["amount"] = metadata.get("amount")
+            if summary["currency"] is None:
+                summary["currency"] = metadata.get("currency")
+        return sorted(summaries_by_id.values(), key=lambda item: str(item["last_updated"]))
+
+    def _build_client_status_distribution(self) -> dict[str, int]:
+        distribution: dict[str, int] = {}
+        for client in self.bank.clients.values():
+            distribution[client.status.value] = distribution.get(client.status.value, 0) + 1
+        return distribution
+
+    def _build_account_distribution_by_currency(self) -> dict[str, int]:
+        distribution: dict[str, int] = {currency.value: 0 for currency in Currency}
+        for account in self.bank.accounts.values():
+            distribution[account.currency.value] += 1
+        return distribution
+
+    def _build_account_distribution_by_type(self) -> dict[str, int]:
+        distribution: dict[str, int] = {}
+        for account in self.bank.accounts.values():
+            account_type = account.__class__.__name__
+            distribution[account_type] = distribution.get(account_type, 0) + 1
+        return distribution
+
+    def _build_transaction_statistics(self) -> dict[str, object]:
+        by_status: dict[str, int] = {}
+        by_type: dict[str, int] = {}
+        transaction_summaries = self._build_transaction_summaries()
+        for summary in transaction_summaries:
+            status = str(summary["status"])
+            transaction_type = str(summary["transaction_type"])
+            by_status[status] = by_status.get(status, 0) + 1
+            by_type[transaction_type] = by_type.get(transaction_type, 0) + 1
+        return {
+            "total": len(transaction_summaries),
+            "by_status": by_status,
+            "by_type": by_type,
+        }
+
+    def _build_risk_level_distribution(self) -> dict[str, int]:
+        distribution = {risk_level.value: 0 for risk_level in RiskLevel}
+        for event in self.bank.audit_log.events:
+            if event.risk_level is None:
+                continue
+            distribution[event.risk_level.value] += 1
+        return distribution
+
+    def _build_top_risky_clients(self, limit: int = 5) -> list[dict[str, object]]:
+        profiles: list[dict[str, object]] = []
+        risk_order = {RiskLevel.LOW.value: 1, RiskLevel.MEDIUM.value: 2, RiskLevel.HIGH.value: 3}
+        for client in self.bank.clients.values():
+            profile = self.bank.get_client_risk_profile(client.client_id)
+            profile["full_name"] = client.full_name
+            profiles.append(profile)
+        profiles.sort(
+            key=lambda item: (
+                risk_order[str(item["highest_risk"])],
+                int(item["blocked_operations_count"]),
+                int(item["total_risk_events"]),
+                int(item["suspicious_events_count"]),
+            ),
+            reverse=True,
+        )
+        return profiles[:limit]
+
+    def _require_matplotlib(self) -> object:
+        try:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as pyplot
+        except ModuleNotFoundError as exc:
+            raise InvalidOperationError("matplotlib is required for chart saving") from exc
+        return pyplot
+
+    def _event_decimal(self, value: object) -> Decimal:
+        try:
+            return Decimal(str(value)).quantize(TWOPLACES, rounding=ROUND_HALF_UP)
+        except (InvalidOperation, ValueError):
+            return Decimal("0.00")
+
+    def _build_bank_balance_timeline(self) -> dict[str, list[float] | list[str]]:
+        completed_events = [event for event in self.bank.audit_log.events if event.event_type == "transaction_completed"]
+        current_totals = {currency_code: amount for currency_code, amount in self.bank.get_total_balance().items()}
+        snapshots: list[dict[str, Decimal]] = [{currency_code: amount for currency_code, amount in current_totals.items()}]
+        labels = ["current"]
+        for event in reversed(completed_events):
+            metadata = event.metadata
+            sender_currency = str(metadata.get("sender_currency", metadata.get("currency", "")))
+            recipient_currency = str(metadata.get("recipient_currency", metadata.get("currency", "")))
+            sender_total_charge = self._event_decimal(metadata.get("sender_total_charge", metadata.get("amount", "0.00")))
+            recipient_amount = self._event_decimal(metadata.get("recipient_amount", metadata.get("amount", "0.00")))
+            if sender_currency in current_totals:
+                current_totals[sender_currency] = (current_totals[sender_currency] + sender_total_charge).quantize(
+                    TWOPLACES,
+                    rounding=ROUND_HALF_UP,
+                )
+            if recipient_currency in current_totals:
+                current_totals[recipient_currency] = (current_totals[recipient_currency] - recipient_amount).quantize(
+                    TWOPLACES,
+                    rounding=ROUND_HALF_UP,
+                )
+            labels.append(event.timestamp.isoformat())
+            snapshots.append({currency_code: amount for currency_code, amount in current_totals.items()})
+        labels.reverse()
+        snapshots.reverse()
+        series = {
+            currency_code: [float(snapshot[currency_code]) for snapshot in snapshots]
+            for currency_code in current_totals
+        }
+        return {"labels": labels, "series": series}
+
+    def _build_client_balance_timeline(self, client_id: str) -> dict[str, list[float] | list[str]]:
+        client = self.bank._get_client(client_id)
+        current_totals: dict[str, Decimal] = self.bank._empty_balances_by_currency()
+        for account_id in client.account_ids:
+            account = self.bank.accounts[account_id]
+            current_totals[account.currency.value] += self.bank._account_total_assets(account)
+        current_totals = {
+            currency_code: amount.quantize(TWOPLACES, rounding=ROUND_HALF_UP)
+            for currency_code, amount in current_totals.items()
+        }
+        related_events = [
+            event
+            for event in self.bank.audit_log.events
+            if event.event_type == "transaction_completed"
+            and (
+                event.client_id == client.client_id
+                or event.metadata.get("recipient_account_id") in client.account_ids
+            )
+        ]
+        snapshots: list[dict[str, Decimal]] = [{currency_code: amount for currency_code, amount in current_totals.items()}]
+        labels = ["current"]
+        for event in reversed(related_events):
+            metadata = event.metadata
+            sender_currency = str(metadata.get("sender_currency", metadata.get("currency", "")))
+            recipient_currency = str(metadata.get("recipient_currency", metadata.get("currency", "")))
+            sender_total_charge = self._event_decimal(metadata.get("sender_total_charge", metadata.get("amount", "0.00")))
+            recipient_amount = self._event_decimal(metadata.get("recipient_amount", metadata.get("amount", "0.00")))
+            sender_account_id = metadata.get("sender_account_id")
+            recipient_account_id = metadata.get("recipient_account_id")
+            if sender_account_id in client.account_ids and sender_currency in current_totals:
+                current_totals[sender_currency] = (current_totals[sender_currency] + sender_total_charge).quantize(
+                    TWOPLACES,
+                    rounding=ROUND_HALF_UP,
+                )
+            if recipient_account_id in client.account_ids and recipient_currency in current_totals:
+                current_totals[recipient_currency] = (current_totals[recipient_currency] - recipient_amount).quantize(
+                    TWOPLACES,
+                    rounding=ROUND_HALF_UP,
+                )
+            labels.append(event.timestamp.isoformat())
+            snapshots.append({currency_code: amount for currency_code, amount in current_totals.items()})
+        labels.reverse()
+        snapshots.reverse()
+        series = {
+            currency_code: [float(snapshot[currency_code]) for snapshot in snapshots]
+            for currency_code in current_totals
+            if any(snapshot[currency_code] != Decimal("0.00") for snapshot in snapshots)
+        }
+        return {"labels": labels, "series": series}
+
+    def build_client_report(self, client_id: str) -> dict[str, object]:
+        client = self.bank._get_client(client_id)
+        accounts = [account.get_account_info() for account in self.bank.search_accounts(client_id=client.client_id)]
+        audit_events = [event.to_dict() for event in self.bank.audit_log.filter_events(client_id=client.client_id)]
+        transactions = [
+            summary
+            for summary in self._build_transaction_summaries()
+            if summary["sender_client_id"] == client.client_id or summary["recipient_client_id"] == client.client_id
+        ]
+        report = {
+            "report_type": ReportType.CLIENT.value,
+            "generated_at": _utc_now(),
+            "bank_name": self.bank.name,
+            "client": client.to_safe_dict(),
+            "accounts": accounts,
+            "total_assets_by_currency": self._build_client_assets_by_currency(client),
+            "risk_profile": self.bank.get_client_risk_profile(client.client_id),
+            "suspicious_activity": list(client.suspicious_activity),
+            "transactions": transactions,
+            "audit_events": audit_events,
+        }
+        return self._serialize_for_export(report)
+
+    def build_bank_report(self) -> dict[str, object]:
+        report = {
+            "report_type": ReportType.BANK.value,
+            "generated_at": _utc_now(),
+            "bank_name": self.bank.name,
+            "clients_count": len(self.bank.clients),
+            "accounts_count": len(self.bank.accounts),
+            "total_balance": self.bank.get_total_balance(),
+            "client_status_distribution": self._build_client_status_distribution(),
+            "account_distribution_by_currency": self._build_account_distribution_by_currency(),
+            "account_distribution_by_type": self._build_account_distribution_by_type(),
+            "client_rankings": self.bank.get_clients_ranking(),
+            "transaction_statistics": self._build_transaction_statistics(),
+            "audit_error_statistics": self.bank.get_audit_error_statistics(),
+            "audit_events_count": len(self.bank.audit_log.events),
+        }
+        return self._serialize_for_export(report)
+
+    def build_risk_report(self) -> dict[str, object]:
+        blocked_operations = [
+            event.to_dict() for event in self.bank.audit_log.filter_events(event_type="transaction_blocked")
+        ]
+        report = {
+            "report_type": ReportType.RISK.value,
+            "generated_at": _utc_now(),
+            "bank_name": self.bank.name,
+            "suspicious_operations": self.bank.get_audit_report_suspicious_operations(RiskLevel.MEDIUM),
+            "blocked_operations": blocked_operations,
+            "blocked_operations_count": len(blocked_operations),
+            "risk_level_distribution": self._build_risk_level_distribution(),
+            "top_risky_clients": self._build_top_risky_clients(),
+            "audit_error_statistics": self.bank.get_audit_error_statistics(),
+        }
+        return self._serialize_for_export(report)
+
+    def render_text(self, report: dict[str, object]) -> str:
+        if not isinstance(report, dict):
+            raise InvalidOperationError("report must be a dictionary")
+        return json.dumps(self._serialize_for_export(report), ensure_ascii=False, indent=2)
+
+    def export_to_json(self, report: dict[str, object], file_path: str) -> str:
+        if not isinstance(report, dict):
+            raise InvalidOperationError("report must be a dictionary")
+        path = self._validate_path(file_path, "file_path")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", encoding="utf-8") as file:
+            json.dump(self._serialize_for_export(report), file, ensure_ascii=False, indent=2)
+        return str(path)
+
+    def export_to_csv(self, report: dict[str, object], file_path: str) -> str:
+        if not isinstance(report, dict):
+            raise InvalidOperationError("report must be a dictionary")
+        path = self._validate_path(file_path, "file_path")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        flattened_rows = self._flatten_report_data(report)
+        with path.open("w", encoding="utf-8", newline="") as file:
+            writer = csv.writer(file)
+            writer.writerow(["field", "value"])
+            writer.writerows(flattened_rows)
+        return str(path)
+
+    def _save_pie_chart(self, pyplot: object, output_path: Path, title: str, data: dict[str, int]) -> str:
+        labels = [label for label, value in data.items() if value > 0]
+        sizes = [value for value in data.values() if value > 0]
+        pyplot.figure(figsize=(8, 6))
+        pyplot.pie(sizes, labels=labels, autopct="%1.1f%%")
+        pyplot.title(title)
+        pyplot.tight_layout()
+        pyplot.savefig(output_path)
+        pyplot.close()
+        return str(output_path)
+
+    def _save_bar_chart(self, pyplot: object, output_path: Path, title: str, data: dict[str, int]) -> str:
+        labels = list(data.keys())
+        values = list(data.values())
+        pyplot.figure(figsize=(10, 6))
+        pyplot.bar(labels, values)
+        pyplot.title(title)
+        pyplot.xticks(rotation=20)
+        pyplot.tight_layout()
+        pyplot.savefig(output_path)
+        pyplot.close()
+        return str(output_path)
+
+    def _save_line_chart(
+        self,
+        pyplot: object,
+        output_path: Path,
+        title: str,
+        timeline: dict[str, list[float] | list[str]],
+    ) -> str:
+        labels = list(timeline["labels"])
+        pyplot.figure(figsize=(10, 6))
+        for series_name, values in dict(timeline["series"]).items():
+            pyplot.plot(range(len(values)), values, label=series_name)
+        pyplot.title(title)
+        pyplot.xlabel("Timeline step")
+        pyplot.ylabel("Balance")
+        if len(labels) > 1:
+            tick_positions = list(range(len(labels)))
+            pyplot.xticks(tick_positions, [str(index) for index in tick_positions], rotation=20)
+        pyplot.legend()
+        pyplot.tight_layout()
+        pyplot.savefig(output_path)
+        pyplot.close()
+        return str(output_path)
+
+    def save_charts(self, output_dir: str, client_id: str | None = None) -> list[str]:
+        output_path = self._validate_path(output_dir, "output_dir")
+        output_path.mkdir(parents=True, exist_ok=True)
+        pyplot = self._require_matplotlib()
+        saved_paths = [
+            self._save_pie_chart(
+                pyplot,
+                output_path / "bank_client_status_pie.png",
+                "Client Status Distribution",
+                self._build_client_status_distribution(),
+            ),
+            self._save_bar_chart(
+                pyplot,
+                output_path / "bank_transaction_status_bar.png",
+                "Transaction Status Distribution",
+                dict(self._build_transaction_statistics()["by_status"]),
+            ),
+            self._save_bar_chart(
+                pyplot,
+                output_path / "risk_level_bar.png",
+                "Risk Level Distribution",
+                self._build_risk_level_distribution(),
+            ),
+            self._save_line_chart(
+                pyplot,
+                output_path / "bank_balance_movement.png",
+                "Bank Balance Movement",
+                self._build_bank_balance_timeline(),
+            ),
+        ]
+        if client_id is not None:
+            client = self.bank._get_client(client_id)
+            saved_paths.append(
+                self._save_line_chart(
+                    pyplot,
+                    output_path / f"client_{client.client_id}_balance_movement.png",
+                    f"Client Balance Movement: {client.full_name}",
+                    self._build_client_balance_timeline(client.client_id),
+                )
+            )
+        return saved_paths
+
+
 class TransactionType(Enum):
     TRANSFER_INTERNAL = "transfer_internal"
     TRANSFER_EXTERNAL = "transfer_external"
@@ -1397,7 +1843,12 @@ class TransactionProcessor:
             return AuditSeverity.MEDIUM
         return AuditSeverity.LOW
 
-    def _build_audit_metadata(self, transaction: Transaction, risk_assessment: RiskAssessment | None = None) -> dict[str, object]:
+    def _build_audit_metadata(
+        self,
+        transaction: Transaction,
+        risk_assessment: RiskAssessment | None = None,
+        execution_details: dict[str, object] | None = None,
+    ) -> dict[str, object]:
         metadata: dict[str, object] = {
             "transaction_type": transaction.transaction_type.value,
             "amount": f"{transaction.amount:.2f}",
@@ -1406,6 +1857,8 @@ class TransactionProcessor:
             "recipient_account_id": transaction.recipient_account_id,
             "fee": f"{transaction.fee:.2f}",
         }
+        if execution_details is not None:
+            metadata.update(execution_details)
         if risk_assessment is not None:
             metadata["risk_reasons"] = list(risk_assessment.reasons)
             metadata["risk_score"] = risk_assessment.score
@@ -1432,7 +1885,7 @@ class TransactionProcessor:
             timestamp=current_time,
         )
 
-    def _execute_transaction(self, transaction: Transaction) -> None:
+    def _execute_transaction(self, transaction: Transaction) -> dict[str, object]:
         sender_account = self.bank._get_account(transaction.sender_account_id)
         recipient_account = self.bank._get_account(transaction.recipient_account_id)
         self._ensure_account_can_transact(sender_account.account_id, "sender")
@@ -1446,6 +1899,12 @@ class TransactionProcessor:
         total_sender_charge = (transaction.amount + transaction.fee).quantize(TWOPLACES, rounding=ROUND_HALF_UP)
         sender_account.withdraw(total_sender_charge)
         recipient_account.deposit(recipient_amount)
+        return {
+            "sender_currency": sender_account.currency.value,
+            "recipient_currency": recipient_account.currency.value,
+            "sender_total_charge": f"{total_sender_charge:.2f}",
+            "recipient_amount": f"{recipient_amount:.2f}",
+        }
 
     def process_transaction(self, transaction: Transaction, now: datetime | None = None) -> Transaction:
         if not isinstance(transaction, Transaction):
@@ -1460,6 +1919,7 @@ class TransactionProcessor:
         sender_client = self.bank._get_account_owner_client(transaction.sender_account_id)
         risk_assessment = self.bank.risk_analyzer.analyze_transaction(transaction, self.bank, current_time)
         self._log_risk_assessment(transaction, sender_client.client_id, risk_assessment, current_time)
+        execution_details: dict[str, object] | None = None
         try:
             if risk_assessment.should_block:
                 reason = "operation blocked by risk analyzer"
@@ -1478,7 +1938,7 @@ class TransactionProcessor:
                 raise InvalidOperationError(reason)
             self._ensure_transaction_time_allowed(transaction, current_time)
             transaction.mark_processing(current_time)
-            self._execute_transaction(transaction)
+            execution_details = self._execute_transaction(transaction)
         except (InvalidOperationError, AccountFrozenError, AccountClosedError, InsufficientFundsError) as exc:
             if not risk_assessment.should_block:
                 self.bank.log_audit_event(
@@ -1489,7 +1949,7 @@ class TransactionProcessor:
                     account_id=transaction.sender_account_id,
                     transaction_id=transaction.transaction_id,
                     risk_level=risk_assessment.risk_level if risk_assessment.reasons else None,
-                    metadata=self._build_audit_metadata(transaction, risk_assessment),
+                    metadata=self._build_audit_metadata(transaction, risk_assessment, execution_details),
                     timestamp=current_time,
                 )
             transaction.mark_failed(str(exc), current_time)
@@ -1503,7 +1963,7 @@ class TransactionProcessor:
                 account_id=transaction.sender_account_id,
                 transaction_id=transaction.transaction_id,
                 risk_level=risk_assessment.risk_level if risk_assessment.reasons else None,
-                metadata=self._build_audit_metadata(transaction, risk_assessment),
+                metadata=self._build_audit_metadata(transaction, risk_assessment, execution_details),
                 timestamp=current_time,
             )
             if transaction.retry_count < self.max_retries:
@@ -1519,7 +1979,7 @@ class TransactionProcessor:
             account_id=transaction.sender_account_id,
             transaction_id=transaction.transaction_id,
             risk_level=risk_assessment.risk_level if risk_assessment.reasons else None,
-            metadata=self._build_audit_metadata(transaction, risk_assessment),
+            metadata=self._build_audit_metadata(transaction, risk_assessment, execution_details),
             timestamp=current_time,
         )
         transaction.mark_completed(current_time)

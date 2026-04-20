@@ -2,6 +2,7 @@
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 import json
+from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -20,6 +21,7 @@ from src.models import (
     InvalidOperationError,
     Owner,
     PremiumAccount,
+    ReportBuilder,
     RiskLevel,
     SavingsAccount,
     Transaction,
@@ -911,6 +913,158 @@ class TransactionProcessorTestCase(unittest.TestCase):
 
         with self.assertRaises(InvalidOperationError):
             queue.cancel_transaction(transaction.transaction_id)
+
+
+class ReportBuilderTestCase(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.audit_log_file_path = f"{self.temp_dir.name}/audit.jsonl"
+        self.bank = Bank(name="Reporting Bank", audit_log_file_path=self.audit_log_file_path)
+        self.first_client = Client(
+            full_name="Anna Smirnova",
+            email="anna.smirnova@example.com",
+            phone="+77005554433",
+            age=28,
+            pin_code="1234",
+        )
+        self.second_client = Client(
+            full_name="Boris Ivanov",
+            email="boris.ivanov@example.com",
+            phone="+77009998877",
+            age=35,
+            pin_code="5678",
+        )
+        self.bank.add_client(self.first_client)
+        self.bank.add_client(self.second_client)
+        with patch.object(self.bank, "_current_hour", return_value=10):
+            self.first_rub = self.bank.open_account(
+                self.first_client.client_id,
+                account_type="bank",
+                balance="1000.00",
+                currency="RUB",
+                account_id="RB_RUB_01",
+            )
+            self.first_usd = self.bank.open_account(
+                self.first_client.client_id,
+                account_type="savings",
+                balance="200.00",
+                currency="USD",
+                account_id="RB_USD_01",
+                min_balance="50.00",
+                monthly_interest_rate="0.01",
+            )
+            self.second_rub = self.bank.open_account(
+                self.second_client.client_id,
+                account_type="bank",
+                balance="300.00",
+                currency="RUB",
+                account_id="RB_RUB_02",
+            )
+        self.processor = TransactionProcessor(
+            self.bank,
+            exchange_rates={
+                ("RUB", "USD"): "0.01",
+                ("USD", "RUB"): "100.00",
+            },
+        )
+        self.completed_transaction = Transaction(
+            transaction_type=TransactionType.TRANSFER_EXTERNAL,
+            amount="100.00",
+            currency="RUB",
+            sender_account_id=self.first_rub.account_id,
+            recipient_account_id=self.second_rub.account_id,
+        )
+        self.failed_transaction = Transaction(
+            transaction_type=TransactionType.TRANSFER_EXTERNAL,
+            amount="20.00",
+            currency="RUB",
+            sender_account_id=self.first_rub.account_id,
+            recipient_account_id=self.second_rub.account_id,
+        )
+        self.blocked_transaction = Transaction(
+            transaction_type=TransactionType.TRANSFER_EXTERNAL,
+            amount="3000.00",
+            currency="RUB",
+            sender_account_id=self.first_rub.account_id,
+            recipient_account_id=self.second_rub.account_id,
+        )
+        self.processor.process_transaction(self.completed_transaction, now=datetime(2026, 4, 18, 8, 0, tzinfo=timezone.utc))
+        self.second_rub.freeze()
+        self.processor.process_transaction(self.failed_transaction, now=datetime(2026, 4, 18, 9, 0, tzinfo=timezone.utc))
+        self.bank.risk_analyzer.large_amount_threshold = Decimal("2000.00")
+        self.processor.process_transaction(self.blocked_transaction, now=datetime(2026, 4, 18, 1, 0, tzinfo=timezone.utc))
+        self.report_builder = ReportBuilder(self.bank)
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    def test_build_client_report_contains_accounts_and_risk_data(self) -> None:
+        report = self.report_builder.build_client_report(self.first_client.client_id)
+
+        self.assertEqual(report["report_type"], "client")
+        self.assertEqual(report["client"]["client_id"], self.first_client.client_id)
+        self.assertEqual(len(report["accounts"]), 2)
+        self.assertIn("RUB", report["total_assets_by_currency"])
+        self.assertGreaterEqual(len(report["transactions"]), 2)
+        self.assertIn("highest_risk", report["risk_profile"])
+
+    def test_build_bank_report_contains_totals_rankings_and_statistics(self) -> None:
+        report = self.report_builder.build_bank_report()
+
+        self.assertEqual(report["report_type"], "bank")
+        self.assertEqual(report["clients_count"], 2)
+        self.assertEqual(report["accounts_count"], 3)
+        self.assertIn("RUB", report["total_balance"])
+        self.assertIn("RUB", report["client_rankings"])
+        self.assertIn("by_status", report["transaction_statistics"])
+        self.assertIn("recipient account is frozen", report["audit_error_statistics"])
+
+    def test_build_risk_report_contains_suspicious_and_blocked_operations(self) -> None:
+        report = self.report_builder.build_risk_report()
+
+        self.assertEqual(report["report_type"], "risk")
+        self.assertGreaterEqual(report["blocked_operations_count"], 1)
+        self.assertGreaterEqual(len(report["suspicious_operations"]), 1)
+        self.assertIn("high", report["risk_level_distribution"])
+        self.assertGreaterEqual(len(report["top_risky_clients"]), 1)
+
+    def test_export_to_json_and_csv_writes_files(self) -> None:
+        report = self.report_builder.build_bank_report()
+        json_path = Path(self.temp_dir.name) / "bank_report.json"
+        csv_path = Path(self.temp_dir.name) / "bank_report.csv"
+
+        exported_json_path = self.report_builder.export_to_json(report, str(json_path))
+        exported_csv_path = self.report_builder.export_to_csv(report, str(csv_path))
+
+        self.assertTrue(Path(exported_json_path).exists())
+        self.assertTrue(Path(exported_csv_path).exists())
+        with json_path.open(encoding="utf-8") as file:
+            exported_json = json.load(file)
+        self.assertEqual(exported_json["report_type"], "bank")
+        with csv_path.open(encoding="utf-8") as file:
+            csv_content = file.read()
+        self.assertIn("field,value", csv_content)
+        self.assertIn("bank_name,Reporting Bank", csv_content)
+
+    def test_render_text_returns_json_like_text(self) -> None:
+        report = self.report_builder.build_risk_report()
+
+        rendered_text = self.report_builder.render_text(report)
+
+        self.assertIn('"report_type": "risk"', rendered_text)
+        self.assertIn('"blocked_operations_count"', rendered_text)
+
+    def test_save_charts_writes_real_png_files(self) -> None:
+        charts_dir = Path(self.temp_dir.name) / "charts"
+
+        saved_paths = self.report_builder.save_charts(str(charts_dir), client_id=self.first_client.client_id)
+
+        self.assertEqual(len(saved_paths), 5)
+        self.assertTrue(all(Path(path).exists() for path in saved_paths))
+        self.assertTrue(all(Path(path).suffix == ".png" for path in saved_paths))
+        self.assertTrue(all(Path(path).stat().st_size > 0 for path in saved_paths))
+        self.assertTrue(any(path.endswith("bank_balance_movement.png") for path in saved_paths))
+        self.assertTrue(any(path.endswith(f"client_{self.first_client.client_id}_balance_movement.png") for path in saved_paths))
 
 
 if __name__ == "__main__":
