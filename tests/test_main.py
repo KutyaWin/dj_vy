@@ -30,6 +30,7 @@ from src.models import (
     TransactionStatus,
     TransactionType,
 )
+from src.main import build_demo_bank, generate_report_artifacts
 
 
 class BankAccountTestCase(unittest.TestCase):
@@ -324,6 +325,11 @@ class BankManagerTestCase(unittest.TestCase):
         self.assertTrue(self.client.is_locked)
         self.assertEqual(self.client.status, ClientStatus.BLOCKED)
         self.assertGreaterEqual(len(self.client.suspicious_activity), 1)
+        failed_auth_events = self.bank.audit_log.filter_events(event_type="authentication_failed", client_id=self.client.client_id)
+        blocked_events = self.bank.audit_log.filter_events(event_type="client_blocked", client_id=self.client.client_id)
+        self.assertEqual(len(failed_auth_events), 3)
+        self.assertEqual(len(blocked_events), 1)
+        self.assertEqual(blocked_events[0].risk_level, RiskLevel.HIGH)
 
     def test_authenticate_client_succeeds_with_correct_pin(self) -> None:
         self.assertTrue(self.bank.authenticate_client(self.client.client_id, "1234"))
@@ -367,6 +373,8 @@ class BankManagerTestCase(unittest.TestCase):
 
         self.assertEqual(self.client.status, ClientStatus.SUSPICIOUS)
         self.assertIn("restricted hours operation: open_account", self.client.suspicious_activity)
+        suspicious_report = self.bank.get_audit_report_suspicious_operations(RiskLevel.MEDIUM)
+        self.assertTrue(any(item["message"] == "restricted hours operation: open_account" for item in suspicious_report))
 
     def test_search_accounts_filters_by_client_and_type(self) -> None:
         self.bank.open_account(self.client.client_id, account_type="bank", balance="100.00")
@@ -1065,6 +1073,28 @@ class ReportBuilderTestCase(unittest.TestCase):
         self.assertTrue(all(Path(path).stat().st_size > 0 for path in saved_paths))
         self.assertTrue(any(path.endswith("bank_balance_movement.png") for path in saved_paths))
         self.assertTrue(any(path.endswith(f"client_{self.first_client.client_id}_balance_movement.png") for path in saved_paths))
+
+
+class MainDemoIntegrationTestCase(unittest.TestCase):
+    def test_generate_report_artifacts_writes_report_files_and_charts(self) -> None:
+        bank, _processor, _queue, clients, _accounts, _phase_times, audit_log_path = build_demo_bank()
+
+        artifacts = generate_report_artifacts(bank, clients, audit_log_path, client_keys=("alice", "boris"))
+
+        output_dir = Path(str(artifacts["output_dir"]))
+        self.assertTrue(output_dir.exists())
+        self.assertTrue(Path(dict(artifacts["bank_report"])["json"]).exists())
+        self.assertTrue(Path(dict(artifacts["bank_report"])["csv"]).exists())
+        self.assertTrue(Path(dict(artifacts["risk_report"])["json"]).exists())
+        self.assertTrue(Path(dict(artifacts["risk_report"])["csv"]).exists())
+        client_reports = dict(artifacts["client_reports"])
+        self.assertEqual(set(client_reports.keys()), {"alice", "boris"})
+        self.assertTrue(all(Path(file_set["json"]).exists() for file_set in client_reports.values()))
+        self.assertTrue(all(Path(file_set["csv"]).exists() for file_set in client_reports.values()))
+        chart_paths = list(artifacts["charts"])
+        self.assertEqual(len(chart_paths), 5)
+        self.assertTrue(all(Path(path).exists() for path in chart_paths))
+        self.assertIn('"report_type": "risk"', str(artifacts["risk_preview"]))
 
 
 if __name__ == "__main__":

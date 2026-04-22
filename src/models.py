@@ -830,13 +830,25 @@ class Bank:
             raise InvalidOperationError("account not linked to client")
         return self._get_client(self.account_to_client[normalized_account_id])
 
-    def _mark_suspicious(self, client: Client, event: str) -> None:
+    def _mark_suspicious(
+        self,
+        client: Client,
+        event: str,
+        risk_level: RiskLevel | str = RiskLevel.MEDIUM,
+    ) -> None:
+        normalized_risk_level = AuditEvent._coerce_risk_level(risk_level)
+        severity_by_risk_level = {
+            RiskLevel.LOW: AuditSeverity.LOW,
+            RiskLevel.MEDIUM: AuditSeverity.MEDIUM,
+            RiskLevel.HIGH: AuditSeverity.HIGH,
+        }
         client.add_suspicious_activity(event)
         self.audit_log.log_event(
-            severity=AuditSeverity.MEDIUM,
+            severity=severity_by_risk_level[normalized_risk_level],
             event_type="suspicious_activity",
             message=event,
             client_id=client.client_id,
+            risk_level=normalized_risk_level,
             metadata={"client_status": client.status.value},
         )
 
@@ -877,12 +889,12 @@ class Bank:
     ) -> None:
         current_hour = self._current_hour(current_time)
         if 0 <= current_hour < 5:
-            self._mark_suspicious(client, f"restricted hours operation: {action_name}")
+            self._mark_suspicious(client, f"restricted hours operation: {action_name}", RiskLevel.MEDIUM)
             raise InvalidOperationError("operations are not allowed from 00:00 to 05:00")
 
     def _ensure_client_is_not_blocked(self, client: Client, action_name: str) -> None:
         if client.is_locked or client.status == ClientStatus.BLOCKED:
-            self._mark_suspicious(client, f"blocked client attempted to {action_name}")
+            self._mark_suspicious(client, f"blocked client attempted to {action_name}", RiskLevel.HIGH)
             raise InvalidOperationError(f"blocked client cannot {action_name.replace('_', ' ')}")
 
     def add_client(self, client: Client) -> Client:
@@ -948,14 +960,37 @@ class Bank:
     def authenticate_client(self, client_id: str, pin_code: str) -> bool:
         client = self._get_client(client_id)
         if client.is_locked:
-            self._mark_suspicious(client, "authentication attempt on blocked client")
+            self._mark_suspicious(client, "authentication attempt on blocked client", RiskLevel.HIGH)
             raise InvalidOperationError("client is blocked")
         if client.pin_code != pin_code:
             client.failed_auth_attempts += 1
+            self.log_audit_event(
+                severity=AuditSeverity.MEDIUM,
+                event_type="authentication_failed",
+                message="invalid credentials",
+                client_id=client.client_id,
+                risk_level=RiskLevel.MEDIUM,
+                metadata={
+                    "failed_auth_attempts": client.failed_auth_attempts,
+                    "remaining_attempts": max(0, 3 - client.failed_auth_attempts),
+                },
+            )
             if client.failed_auth_attempts >= 3:
                 client.is_locked = True
                 client.status = ClientStatus.BLOCKED
-                client.add_suspicious_activity("client locked after 3 failed authentication attempts")
+                self._mark_suspicious(
+                    client,
+                    "client locked after 3 failed authentication attempts",
+                    RiskLevel.HIGH,
+                )
+                self.log_audit_event(
+                    severity=AuditSeverity.HIGH,
+                    event_type="client_blocked",
+                    message="client blocked after repeated authentication failures",
+                    client_id=client.client_id,
+                    risk_level=RiskLevel.HIGH,
+                    metadata={"failed_auth_attempts": client.failed_auth_attempts},
+                )
             raise InvalidOperationError("invalid credentials")
         client.failed_auth_attempts = 0
         return True

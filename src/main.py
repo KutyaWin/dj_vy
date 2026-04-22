@@ -11,6 +11,8 @@ try:
         AbstractAccount,
         Bank,
         Client,
+        InvalidOperationError,
+        ReportBuilder,
         RiskLevel,
         Transaction,
         TransactionProcessor,
@@ -23,6 +25,8 @@ except ImportError:
         AbstractAccount,
         Bank,
         Client,
+        InvalidOperationError,
+        ReportBuilder,
         RiskLevel,
         Transaction,
         TransactionProcessor,
@@ -447,7 +451,75 @@ def show_client_scenarios(bank: Bank, clients: dict[str, Client], transactions: 
         print(f"Risk profile: {risk_profile}")
 
 
-def show_reports(bank: Bank, transactions: dict[str, Transaction], audit_log_path: Path) -> None:
+def demonstrate_security_scenarios(bank: Bank, clients: dict[str, Client]) -> None:
+    print_section("SECURITY INCIDENTS")
+    target_client = clients["farid"]
+    for attempt in range(1, 4):
+        try:
+            bank.authenticate_client(target_client.client_id, "0000")
+        except InvalidOperationError as exc:
+            print(
+                f"[AUTH FAILED] attempt={attempt} | client={target_client.full_name} | "
+                f"reason={str(exc)} | failed_attempts={target_client.failed_auth_attempts}"
+            )
+    try:
+        bank.authenticate_client(target_client.client_id, target_client.pin_code)
+    except InvalidOperationError as exc:
+        print(f"[AUTH BLOCKED] client={target_client.full_name} | reason={str(exc)}")
+    target_account_id = next(iter(target_client.account_ids))
+    try:
+        run_during_allowed_hours(bank, lambda: bank.freeze_account(target_account_id))
+    except InvalidOperationError as exc:
+        print(f"[BLOCKED ACTION] client={target_client.full_name} | reason={str(exc)}")
+
+
+def generate_report_artifacts(
+    bank: Bank,
+    clients: dict[str, Client],
+    audit_log_path: Path,
+    client_keys: tuple[str, ...] | None = None,
+) -> dict[str, object]:
+    report_builder = ReportBuilder(bank)
+    output_dir = audit_log_path.parent / f"{audit_log_path.stem}_reports"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    selected_client_keys = tuple(client_keys) if client_keys is not None else tuple(list(clients.keys())[:3])
+    client_reports: dict[str, dict[str, str]] = {}
+    for client_key in selected_client_keys:
+        client_report = report_builder.build_client_report(clients[client_key].client_id)
+        client_reports[client_key] = {
+            "json": report_builder.export_to_json(client_report, str(output_dir / f"{client_key}_client_report.json")),
+            "csv": report_builder.export_to_csv(client_report, str(output_dir / f"{client_key}_client_report.csv")),
+        }
+    bank_report = report_builder.build_bank_report()
+    risk_report = report_builder.build_risk_report()
+    bank_report_files = {
+        "json": report_builder.export_to_json(bank_report, str(output_dir / "bank_report.json")),
+        "csv": report_builder.export_to_csv(bank_report, str(output_dir / "bank_report.csv")),
+    }
+    risk_report_files = {
+        "json": report_builder.export_to_json(risk_report, str(output_dir / "risk_report.json")),
+        "csv": report_builder.export_to_csv(risk_report, str(output_dir / "risk_report.csv")),
+    }
+    charts = report_builder.save_charts(
+        str(output_dir / "charts"),
+        client_id=clients[selected_client_keys[0]].client_id if selected_client_keys else None,
+    )
+    return {
+        "output_dir": str(output_dir),
+        "client_reports": client_reports,
+        "bank_report": bank_report_files,
+        "risk_report": risk_report_files,
+        "risk_preview": report_builder.render_text(risk_report),
+        "charts": charts,
+    }
+
+
+def show_reports(
+    bank: Bank,
+    transactions: dict[str, Transaction],
+    audit_log_path: Path,
+    report_artifacts: dict[str, object],
+) -> None:
     print_section("SUSPICIOUS OPERATIONS REPORT")
     suspicious_operations = bank.get_audit_report_suspicious_operations(RiskLevel.MEDIUM)
     for event in suspicious_operations[:12]:
@@ -480,6 +552,23 @@ def show_reports(bank: Bank, transactions: dict[str, Transaction], audit_log_pat
     total_balance = bank.get_total_balance()
     print(format_currency_map({currency_code: f"{amount:.2f}" for currency_code, amount in total_balance.items()}))
 
+    print_section("REPORT EXPORTS")
+    print(f"Artifacts directory: {report_artifacts['output_dir']}")
+    print("Client reports:")
+    for client_key, file_set in dict(report_artifacts["client_reports"]).items():
+        print(f"  - {client_key}: json={file_set['json']} | csv={file_set['csv']}")
+    bank_report_files = dict(report_artifacts["bank_report"])
+    risk_report_files = dict(report_artifacts["risk_report"])
+    print(f"Bank report: json={bank_report_files['json']} | csv={bank_report_files['csv']}")
+    print(f"Risk report: json={risk_report_files['json']} | csv={risk_report_files['csv']}")
+    print(f"Charts saved: {len(list(report_artifacts['charts']))}")
+    for chart_path in list(report_artifacts["charts"]):
+        print(f"  - {chart_path}")
+    preview_lines = str(report_artifacts["risk_preview"]).splitlines()
+    print("Risk report text preview:")
+    for line in preview_lines[:8]:
+        print(f"  {line}")
+
     print_section("DEMO SUMMARY")
     print(f"Clients: {len(bank.clients)}")
     print(f"Accounts: {len(bank.accounts)}")
@@ -510,8 +599,10 @@ def main() -> None:
     process_phase("Midday batch", queue, processor, bank, phase_times["midday"])
     process_phase("Night batch", queue, processor, bank, phase_times["night"])
 
+    demonstrate_security_scenarios(bank, clients)
+    report_artifacts = generate_report_artifacts(bank, clients, audit_log_path)
     show_client_scenarios(bank, clients, transactions)
-    show_reports(bank, transactions, audit_log_path)
+    show_reports(bank, transactions, audit_log_path, report_artifacts)
 
 
 if __name__ == "__main__":
