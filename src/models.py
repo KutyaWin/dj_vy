@@ -934,6 +934,21 @@ class Bank:
         self.accounts[account.account_id] = account
         self.account_to_client[account.account_id] = client.client_id
         client.add_account_id(account.account_id)
+        account_info = account.get_account_info()
+        self.log_audit_event(
+            severity=AuditSeverity.LOW,
+            event_type="account_opened",
+            message="account opened",
+            client_id=client.client_id,
+            account_id=account.account_id,
+            metadata={
+                "account_type": account_info["account_type"],
+                "account_status": account_info["status"],
+                "currency": account_info["currency"],
+                "balance": account_info["balance"],
+                "client_status": client.status.value,
+            },
+        )
         return account
 
     def close_account(self, account_id: str) -> AccountStatus:
@@ -941,21 +956,63 @@ class Bank:
         client = self._get_account_owner_client(account_id)
         self._ensure_operation_time_allowed(client, "close_account")
         self._ensure_client_is_not_blocked(client, "close_account")
-        return account.close()
+        status = account.close()
+        self.log_audit_event(
+            severity=AuditSeverity.MEDIUM,
+            event_type="account_closed",
+            message="account closed",
+            client_id=client.client_id,
+            account_id=account.account_id,
+            metadata={
+                "account_type": account.__class__.__name__,
+                "account_status": status.value,
+                "currency": account.currency.value,
+                "client_status": client.status.value,
+            },
+        )
+        return status
 
     def freeze_account(self, account_id: str) -> AccountStatus:
         account = self._get_account(account_id)
         client = self._get_account_owner_client(account_id)
         self._ensure_operation_time_allowed(client, "freeze_account")
         self._ensure_client_is_not_blocked(client, "freeze_account")
-        return account.freeze()
+        status = account.freeze()
+        self.log_audit_event(
+            severity=AuditSeverity.HIGH,
+            event_type="account_frozen",
+            message="account frozen",
+            client_id=client.client_id,
+            account_id=account.account_id,
+            metadata={
+                "account_type": account.__class__.__name__,
+                "account_status": status.value,
+                "currency": account.currency.value,
+                "client_status": client.status.value,
+            },
+        )
+        return status
 
     def unfreeze_account(self, account_id: str) -> AccountStatus:
         account = self._get_account(account_id)
         client = self._get_account_owner_client(account_id)
         self._ensure_operation_time_allowed(client, "unfreeze_account")
         self._ensure_client_is_not_blocked(client, "unfreeze_account")
-        return account.activate()
+        status = account.activate()
+        self.log_audit_event(
+            severity=AuditSeverity.MEDIUM,
+            event_type="account_unfrozen",
+            message="account unfrozen",
+            client_id=client.client_id,
+            account_id=account.account_id,
+            metadata={
+                "account_type": account.__class__.__name__,
+                "account_status": status.value,
+                "currency": account.currency.value,
+                "client_status": client.status.value,
+            },
+        )
+        return status
 
     def authenticate_client(self, client_id: str, pin_code: str) -> bool:
         client = self._get_client(client_id)
@@ -1951,11 +2008,13 @@ class TransactionProcessor:
             transaction.status = TransactionStatus.SCHEDULED
             transaction.updated_at = current_time
             return transaction
-        sender_client = self.bank._get_account_owner_client(transaction.sender_account_id)
-        risk_assessment = self.bank.risk_analyzer.analyze_transaction(transaction, self.bank, current_time)
-        self._log_risk_assessment(transaction, sender_client.client_id, risk_assessment, current_time)
+        sender_client: Client | None = None
+        risk_assessment: RiskAssessment | None = None
         execution_details: dict[str, object] | None = None
         try:
+            sender_client = self.bank._get_account_owner_client(transaction.sender_account_id)
+            risk_assessment = self.bank.risk_analyzer.analyze_transaction(transaction, self.bank, current_time)
+            self._log_risk_assessment(transaction, sender_client.client_id, risk_assessment, current_time)
             if risk_assessment.should_block:
                 reason = "operation blocked by risk analyzer"
                 self.bank._mark_suspicious(sender_client, f"risk blocked operation: {transaction.transaction_type.value}")
@@ -1975,15 +2034,15 @@ class TransactionProcessor:
             transaction.mark_processing(current_time)
             execution_details = self._execute_transaction(transaction)
         except (InvalidOperationError, AccountFrozenError, AccountClosedError, InsufficientFundsError) as exc:
-            if not risk_assessment.should_block:
+            if risk_assessment is None or not risk_assessment.should_block:
                 self.bank.log_audit_event(
                     severity=AuditSeverity.MEDIUM,
                     event_type="transaction_failed",
                     message=str(exc),
-                    client_id=sender_client.client_id,
+                    client_id=sender_client.client_id if sender_client is not None else None,
                     account_id=transaction.sender_account_id,
                     transaction_id=transaction.transaction_id,
-                    risk_level=risk_assessment.risk_level if risk_assessment.reasons else None,
+                    risk_level=risk_assessment.risk_level if risk_assessment is not None and risk_assessment.reasons else None,
                     metadata=self._build_audit_metadata(transaction, risk_assessment, execution_details),
                     timestamp=current_time,
                 )
@@ -1994,10 +2053,10 @@ class TransactionProcessor:
                 severity=AuditSeverity.HIGH,
                 event_type="operation_error",
                 message=str(exc),
-                client_id=sender_client.client_id,
+                client_id=sender_client.client_id if sender_client is not None else None,
                 account_id=transaction.sender_account_id,
                 transaction_id=transaction.transaction_id,
-                risk_level=risk_assessment.risk_level if risk_assessment.reasons else None,
+                risk_level=risk_assessment.risk_level if risk_assessment is not None and risk_assessment.reasons else None,
                 metadata=self._build_audit_metadata(transaction, risk_assessment, execution_details),
                 timestamp=current_time,
             )
@@ -2047,15 +2106,22 @@ class TransactionProcessor:
         if max_cycles is not None and (not isinstance(max_cycles, int) or max_cycles <= 0):
             raise InvalidOperationError("max_cycles must be a positive integer")
         processed_transactions: list[Transaction] = []
+        processed_transaction_ids: set[str] = set()
         current_cycle = 0
         while True:
             current_cycle += 1
             if max_cycles is not None and current_cycle > max_cycles:
                 break
-            batch = self.process_queue(transaction_queue, now)
+            batch = [
+                transaction
+                for transaction in transaction_queue.get_ready_transactions(now)
+                if transaction.transaction_id not in processed_transaction_ids
+            ]
             if not batch:
                 break
-            processed_transactions.extend(batch)
-            if all(transaction.status != TransactionStatus.RETRYING for transaction in batch):
+            for transaction in batch:
+                processed_transactions.append(self.process_transaction(transaction, now))
+                processed_transaction_ids.add(transaction.transaction_id)
+            if all(transaction.status != TransactionStatus.RETRYING for transaction in processed_transactions):
                 break
         return processed_transactions

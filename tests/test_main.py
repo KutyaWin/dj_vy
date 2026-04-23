@@ -342,6 +342,12 @@ class BankManagerTestCase(unittest.TestCase):
         self.assertEqual(self.bank.unfreeze_account(account.account_id), AccountStatus.ACTIVE)
         self.assertEqual(self.bank.close_account(account.account_id), AccountStatus.CLOSED)
 
+        account_events = [event for event in self.bank.audit_log.events if event.account_id == account.account_id]
+        self.assertEqual(len([event for event in account_events if event.event_type == "account_opened"]), 1)
+        self.assertEqual(len([event for event in account_events if event.event_type == "account_frozen"]), 1)
+        self.assertEqual(len([event for event in account_events if event.event_type == "account_unfrozen"]), 1)
+        self.assertEqual(len([event for event in account_events if event.event_type == "account_closed"]), 1)
+
     def test_blocked_client_cannot_manage_account_state(self) -> None:
         account = self.bank.open_account(self.client.client_id, account_type="premium", balance="400.00")
 
@@ -735,6 +741,45 @@ class TransactionProcessorTestCase(unittest.TestCase):
         self.assertEqual(processed_transaction.status, TransactionStatus.RETRYING)
         self.assertEqual(processed_transaction.retry_count, 1)
         self.assertIn("temporary processor error", processed_transaction.error_log)
+
+    def test_process_until_idle_does_not_retry_same_transaction_in_one_call(self) -> None:
+        queue = TransactionQueue()
+        transaction = Transaction(
+            transaction_type=TransactionType.TRANSFER_INTERNAL,
+            amount="10.00",
+            currency="RUB",
+            sender_account_id=self.first_rub.account_id,
+            recipient_account_id=self.second_rub.account_id,
+        )
+        queue.add_transaction(transaction)
+
+        with patch.object(self.processor, "_execute_transaction", side_effect=RuntimeError("temporary processor error")):
+            processed_transactions = self.processor.process_until_idle(queue)
+
+        self.assertEqual(len(processed_transactions), 1)
+        self.assertIs(processed_transactions[0], transaction)
+        self.assertEqual(transaction.status, TransactionStatus.RETRYING)
+        self.assertEqual(transaction.retry_count, 1)
+
+    def test_processor_marks_unknown_sender_account_as_failed_and_audited(self) -> None:
+        transaction = Transaction(
+            transaction_type=TransactionType.TRANSFER_EXTERNAL,
+            amount="10.00",
+            currency="RUB",
+            sender_account_id="UNKNOWN1",
+            recipient_account_id=self.second_rub.account_id,
+        )
+
+        processed_transaction = self.processor.process_transaction(transaction)
+
+        self.assertEqual(processed_transaction.status, TransactionStatus.FAILED)
+        self.assertEqual(processed_transaction.failure_reason, "account not linked to client")
+        failed_events = self.bank.audit_log.filter_events(
+            event_type="transaction_failed",
+            transaction_id=transaction.transaction_id,
+        )
+        self.assertEqual(len(failed_events), 1)
+        self.assertIsNone(failed_events[0].client_id)
 
     def test_processor_blocks_transactions_during_restricted_hours_and_marks_sender_suspicious(self) -> None:
         restricted_time = datetime(2026, 4, 16, 1, 30, tzinfo=timezone.utc)
