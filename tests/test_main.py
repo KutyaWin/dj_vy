@@ -249,6 +249,8 @@ class BankAccountTestCase(unittest.TestCase):
 class BankManagerTestCase(unittest.TestCase):
     def setUp(self) -> None:
         self.bank = Bank(name="My Bank")
+        self.current_hour_patcher = patch.object(self.bank, "_current_hour", return_value=10)
+        self.current_hour_patcher.start()
         self.client = Client(
             full_name="Anna Smirnova",
             email="anna.smirnova@example.com",
@@ -265,6 +267,9 @@ class BankManagerTestCase(unittest.TestCase):
         )
         self.bank.add_client(self.client)
         self.bank.add_client(self.second_client)
+
+    def tearDown(self) -> None:
+        self.current_hour_patcher.stop()
 
     def test_client_requires_adult_age(self) -> None:
         with self.assertRaises(InvalidOperationError):
@@ -373,7 +378,7 @@ class BankManagerTestCase(unittest.TestCase):
         self.assertEqual(account.status, AccountStatus.FROZEN)
 
     def test_restricted_hours_block_operations_and_mark_suspicious(self) -> None:
-        with patch.object(Bank, "_current_hour", return_value=1):
+        with patch.object(self.bank, "_current_hour", return_value=1):
             with self.assertRaises(InvalidOperationError):
                 self.bank.open_account(self.client.client_id, account_type="bank", balance="50.00")
 
@@ -393,16 +398,17 @@ class BankManagerTestCase(unittest.TestCase):
         self.assertIsInstance(matched_accounts[0], InvestmentAccount)
 
     def test_get_total_balance_and_clients_ranking(self) -> None:
-        self.bank.open_account(self.client.client_id, account_type="bank", balance="100.00", currency="RUB")
-        self.bank.open_account(
-            self.client.client_id,
-            account_type="investment",
-            balance="50.00",
-            currency="USD",
-            portfolio={"stocks": "250.00", "bonds": "100.00", "etf": "50.00"},
-        )
-        self.bank.open_account(self.second_client.client_id, account_type="bank", balance="300.00", currency="USD")
-        self.bank.open_account(self.second_client.client_id, account_type="bank", balance="200.00", currency="RUB")
+        with patch.object(self.bank, "_current_hour", return_value=10):
+            self.bank.open_account(self.client.client_id, account_type="bank", balance="100.00", currency="RUB")
+            self.bank.open_account(
+                self.client.client_id,
+                account_type="investment",
+                balance="50.00",
+                currency="USD",
+                portfolio={"stocks": "250.00", "bonds": "100.00", "etf": "50.00"},
+            )
+            self.bank.open_account(self.second_client.client_id, account_type="bank", balance="300.00", currency="USD")
+            self.bank.open_account(self.second_client.client_id, account_type="bank", balance="200.00", currency="RUB")
 
         total_balance = self.bank.get_total_balance()
         ranking = self.bank.get_clients_ranking()
@@ -530,44 +536,45 @@ class TransactionProcessorTestCase(unittest.TestCase):
         self.bank.add_client(self.first_client)
         self.bank.add_client(self.second_client)
         self.bank.add_client(self.third_client)
-        self.first_rub = self.bank.open_account(
-            self.first_client.client_id,
-            account_type="bank",
-            balance="1000.00",
-            currency="RUB",
-            account_id="A_RUB_01",
-        )
-        self.first_usd = self.bank.open_account(
-            self.first_client.client_id,
-            account_type="bank",
-            balance="200.00",
-            currency="USD",
-            account_id="A_USD_01",
-        )
-        self.second_rub = self.bank.open_account(
-            self.second_client.client_id,
-            account_type="bank",
-            balance="300.00",
-            currency="RUB",
-            account_id="B_RUB_01",
-        )
-        self.second_usd = self.bank.open_account(
-            self.second_client.client_id,
-            account_type="bank",
-            balance="50.00",
-            currency="USD",
-            account_id="B_USD_01",
-        )
-        self.third_premium = self.bank.open_account(
-            self.third_client.client_id,
-            account_type="premium",
-            balance="20.00",
-            currency="RUB",
-            overdraft_limit="200.00",
-            fixed_commission="0.00",
-            single_withdrawal_limit="500.00",
-            account_id="C_PRM_01",
-        )
+        with patch.object(self.bank, "_current_hour", return_value=10):
+            self.first_rub = self.bank.open_account(
+                self.first_client.client_id,
+                account_type="bank",
+                balance="1000.00",
+                currency="RUB",
+                account_id="A_RUB_01",
+            )
+            self.first_usd = self.bank.open_account(
+                self.first_client.client_id,
+                account_type="bank",
+                balance="200.00",
+                currency="USD",
+                account_id="A_USD_01",
+            )
+            self.second_rub = self.bank.open_account(
+                self.second_client.client_id,
+                account_type="bank",
+                balance="300.00",
+                currency="RUB",
+                account_id="B_RUB_01",
+            )
+            self.second_usd = self.bank.open_account(
+                self.second_client.client_id,
+                account_type="bank",
+                balance="50.00",
+                currency="USD",
+                account_id="B_USD_01",
+            )
+            self.third_premium = self.bank.open_account(
+                self.third_client.client_id,
+                account_type="premium",
+                balance="20.00",
+                currency="RUB",
+                overdraft_limit="200.00",
+                fixed_commission="0.00",
+                single_withdrawal_limit="500.00",
+                account_id="C_PRM_01",
+            )
         self.processor = TransactionProcessor(
             self.bank,
             exchange_rates={
@@ -781,6 +788,48 @@ class TransactionProcessorTestCase(unittest.TestCase):
         self.assertEqual(len(failed_events), 1)
         self.assertIsNone(failed_events[0].client_id)
 
+    def test_risk_analyzer_normalizes_large_amounts_across_currencies(self) -> None:
+        with patch.object(self.bank, "_current_hour", return_value=10):
+            first_kzt = self.bank.open_account(
+                self.first_client.client_id,
+                account_type="bank",
+                balance="10000.00",
+                currency="KZT",
+                account_id="A_KZT_01",
+            )
+            second_kzt = self.bank.open_account(
+                self.second_client.client_id,
+                account_type="bank",
+                balance="5000.00",
+                currency="KZT",
+                account_id="B_KZT_01",
+            )
+        self.bank.risk_analyzer.large_amount_threshold = Decimal("1000.00")
+        midday = datetime(2026, 4, 16, 12, 0, tzinfo=timezone.utc)
+        kzt_transaction = Transaction(
+            transaction_type=TransactionType.TRANSFER_EXTERNAL,
+            amount="1500.00",
+            currency="KZT",
+            sender_account_id=first_kzt.account_id,
+            recipient_account_id=second_kzt.account_id,
+        )
+        usd_transaction = Transaction(
+            transaction_type=TransactionType.TRANSFER_EXTERNAL,
+            amount="1500.00",
+            currency="USD",
+            sender_account_id=self.first_usd.account_id,
+            recipient_account_id=self.second_usd.account_id,
+        )
+
+        kzt_risk = self.bank.risk_analyzer.analyze_transaction(kzt_transaction, self.bank, midday)
+        usd_risk = self.bank.risk_analyzer.analyze_transaction(usd_transaction, self.bank, midday)
+
+        self.assertNotIn("large amount", kzt_risk.reasons)
+        self.assertIn("large amount", usd_risk.reasons)
+
+    def test_current_hour_uses_utc_for_aware_datetimes(self) -> None:
+        self.assertEqual(self.bank._current_hour(datetime(2026, 4, 16, 0, 30, tzinfo=timezone(timedelta(hours=5)))), 19)
+
     def test_processor_blocks_transactions_during_restricted_hours_and_marks_sender_suspicious(self) -> None:
         restricted_time = datetime(2026, 4, 16, 1, 30, tzinfo=timezone.utc)
         transaction = Transaction(
@@ -936,8 +985,8 @@ class TransactionProcessorTestCase(unittest.TestCase):
         self.assertEqual(transactions[8].status, TransactionStatus.SCHEDULED)
         self.assertEqual(transactions[9].status, TransactionStatus.CANCELLED)
         self.assertEqual(transactions[0].failure_reason, "internal transfer requires accounts of the same client")
-        self.assertEqual(transactions[3].failure_reason, "recipient account is frozen")
-        self.assertEqual(transactions[5].failure_reason, "internal transfer requires matching account currencies")
+        self.assertEqual(transactions[3].failure_reason, "operation blocked by risk analyzer")
+        self.assertEqual(transactions[5].failure_reason, "operation blocked by risk analyzer")
         self.assertEqual(transactions[7].failure_reason, "insufficient funds")
 
         self.second_usd.activate()
@@ -1060,6 +1109,18 @@ class ReportBuilderTestCase(unittest.TestCase):
         self.assertIn("RUB", report["total_assets_by_currency"])
         self.assertGreaterEqual(len(report["transactions"]), 2)
         self.assertIn("highest_risk", report["risk_profile"])
+
+    def test_build_client_report_includes_incoming_transfer_audit_for_recipient(self) -> None:
+        report = self.report_builder.build_client_report(self.second_client.client_id)
+
+        self.assertTrue(any(event["event_type"] == "transaction_completed" for event in report["audit_events"]))
+        self.assertTrue(
+            any(
+                event["metadata"].get("recipient_client_id") == self.second_client.client_id
+                for event in report["audit_events"]
+                if isinstance(event.get("metadata"), dict)
+            )
+        )
 
     def test_build_bank_report_contains_totals_rankings_and_statistics(self) -> None:
         report = self.report_builder.build_bank_report()

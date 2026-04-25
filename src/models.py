@@ -728,6 +728,8 @@ class RiskAnalyzer:
         frequent_operations_threshold: int = 3,
         frequent_operations_window_minutes: int = 10,
         block_level: RiskLevel | str = RiskLevel.HIGH,
+        base_currency: Currency | str = Currency.RUB,
+        reference_exchange_rates: dict[tuple[str, str], Decimal | int | float | str] | None = None,
     ) -> None:
         self.large_amount_threshold = Transaction._normalize_amount(large_amount_threshold)
         if not isinstance(frequent_operations_threshold, int) or frequent_operations_threshold <= 0:
@@ -737,6 +739,21 @@ class RiskAnalyzer:
         self.frequent_operations_threshold = frequent_operations_threshold
         self.frequent_operations_window_minutes = frequent_operations_window_minutes
         self.block_level = AuditEvent._coerce_risk_level(block_level)
+        self.base_currency = Transaction._coerce_currency(base_currency)
+        default_reference_rates: dict[tuple[str, str], Decimal | int | float | str] = {
+            (Currency.USD.value, Currency.RUB.value): "90.00",
+            (Currency.EUR.value, Currency.RUB.value): "98.00",
+            (Currency.KZT.value, Currency.RUB.value): "0.18",
+            (Currency.CNY.value, Currency.RUB.value): "12.50",
+        }
+        normalized_reference_rates: dict[tuple[str, str], Decimal] = {}
+        for currency_pair, rate in (reference_exchange_rates or default_reference_rates).items():
+            if not isinstance(currency_pair, tuple) or len(currency_pair) != 2:
+                raise InvalidOperationError("reference exchange rate key must be a pair of currency codes")
+            source_currency = Transaction._coerce_currency(currency_pair[0]).value
+            target_currency = Transaction._coerce_currency(currency_pair[1]).value
+            normalized_reference_rates[(source_currency, target_currency)] = Transaction._normalize_amount(rate)
+        self.reference_exchange_rates = normalized_reference_rates
 
     def _risk_from_score(self, score: int) -> RiskLevel:
         if score >= 4:
@@ -749,6 +766,18 @@ class RiskAnalyzer:
         risk_order = {RiskLevel.LOW: 1, RiskLevel.MEDIUM: 2, RiskLevel.HIGH: 3}
         return risk_order[risk_level] >= risk_order[self.block_level]
 
+    def _normalize_to_base_currency(self, amount: Decimal, currency: Currency) -> Decimal | None:
+        if currency == self.base_currency:
+            return amount.quantize(TWOPLACES, rounding=ROUND_HALF_UP)
+        direct_pair = (currency.value, self.base_currency.value)
+        if direct_pair in self.reference_exchange_rates:
+            return (amount * self.reference_exchange_rates[direct_pair]).quantize(TWOPLACES, rounding=ROUND_HALF_UP)
+        reverse_pair = (self.base_currency.value, currency.value)
+        if reverse_pair in self.reference_exchange_rates:
+            reverse_rate = self.reference_exchange_rates[reverse_pair]
+            return (amount / reverse_rate).quantize(TWOPLACES, rounding=ROUND_HALF_UP)
+        return None
+
     def analyze_transaction(self, transaction: Transaction, bank: Bank, current_time: datetime) -> RiskAssessment:
         if not isinstance(transaction, Transaction):
             raise InvalidOperationError("transaction must be a Transaction instance")
@@ -758,7 +787,8 @@ class RiskAnalyzer:
         sender_client = bank._get_account_owner_client(transaction.sender_account_id)
         reasons: list[str] = []
         score = 0
-        if transaction.amount >= self.large_amount_threshold:
+        normalized_amount = self._normalize_to_base_currency(transaction.amount, transaction.currency)
+        if normalized_amount is not None and normalized_amount >= self.large_amount_threshold:
             reasons.append("large amount")
             score += 2
         recent_events = [
@@ -878,8 +908,8 @@ class Bank:
 
     def _current_hour(self, current_time: datetime | None = None) -> int:
         if current_time is None:
-            return datetime.now().hour
-        return current_time.hour
+            return _utc_now().hour
+        return _normalize_utc_datetime(current_time, "current_time").hour
 
     def _ensure_operation_time_allowed(
         self,
@@ -1433,7 +1463,13 @@ class ReportBuilder:
     def build_client_report(self, client_id: str) -> dict[str, object]:
         client = self.bank._get_client(client_id)
         accounts = [account.get_account_info() for account in self.bank.search_accounts(client_id=client.client_id)]
-        audit_events = [event.to_dict() for event in self.bank.audit_log.filter_events(client_id=client.client_id)]
+        audit_events = [
+            event.to_dict()
+            for event in self.bank.audit_log.events
+            if event.client_id == client.client_id
+            or event.metadata.get("sender_client_id") == client.client_id
+            or event.metadata.get("recipient_client_id") == client.client_id
+        ]
         transactions = [
             summary
             for summary in self._build_transaction_summaries()
@@ -1949,6 +1985,12 @@ class TransactionProcessor:
             "recipient_account_id": transaction.recipient_account_id,
             "fee": f"{transaction.fee:.2f}",
         }
+        sender_client_id = self.bank.account_to_client.get(transaction.sender_account_id)
+        recipient_client_id = self.bank.account_to_client.get(transaction.recipient_account_id)
+        if sender_client_id is not None:
+            metadata["sender_client_id"] = sender_client_id
+        if recipient_client_id is not None:
+            metadata["recipient_client_id"] = recipient_client_id
         if execution_details is not None:
             metadata.update(execution_details)
         if risk_assessment is not None:
