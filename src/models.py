@@ -1958,6 +1958,12 @@ class TransactionProcessor:
             return Decimal("0.00")
         return self.external_transfer_fee.quantize(TWOPLACES, rounding=ROUND_HALF_UP)
 
+    @staticmethod
+    def _calculate_account_fee(sender_account: AbstractAccount) -> Decimal:
+        if isinstance(sender_account, PremiumAccount):
+            return sender_account.fixed_commission.quantize(TWOPLACES, rounding=ROUND_HALF_UP)
+        return Decimal("0.00")
+
     def _ensure_transaction_time_allowed(self, transaction: Transaction, current_time: datetime) -> None:
         sender_client = self.bank._get_account_owner_client(transaction.sender_account_id)
         action_name = f"transaction_{transaction.transaction_type.value}"
@@ -2028,14 +2034,20 @@ class TransactionProcessor:
         _, _, same_client = self._validate_transaction_type(transaction)
         if transaction.currency != sender_account.currency:
             raise InvalidOperationError("transaction currency must match sender account currency")
-        transaction.fee = self._calculate_fee(same_client)
+        processor_fee = self._calculate_fee(same_client)
+        account_fee = self._calculate_account_fee(sender_account)
+        transaction.fee = (processor_fee + account_fee).quantize(TWOPLACES, rounding=ROUND_HALF_UP)
         recipient_amount = self._convert_amount(transaction.amount, sender_account.currency, recipient_account.currency)
-        total_sender_charge = (transaction.amount + transaction.fee).quantize(TWOPLACES, rounding=ROUND_HALF_UP)
-        sender_account.withdraw(total_sender_charge)
+        sender_charge_before_account_fee = (transaction.amount + processor_fee).quantize(TWOPLACES, rounding=ROUND_HALF_UP)
+        total_sender_charge = (sender_charge_before_account_fee + account_fee).quantize(TWOPLACES, rounding=ROUND_HALF_UP)
+        sender_account.withdraw(sender_charge_before_account_fee)
         recipient_account.deposit(recipient_amount)
         return {
             "sender_currency": sender_account.currency.value,
             "recipient_currency": recipient_account.currency.value,
+            "processor_fee": f"{processor_fee:.2f}",
+            "account_fee": f"{account_fee:.2f}",
+            "total_fee": f"{transaction.fee:.2f}",
             "sender_total_charge": f"{total_sender_charge:.2f}",
             "recipient_amount": f"{recipient_amount:.2f}",
         }

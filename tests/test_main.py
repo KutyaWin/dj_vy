@@ -733,6 +733,41 @@ class TransactionProcessorTestCase(unittest.TestCase):
         self.assertEqual(self.third_premium.balance, Decimal("-90.00"))
         self.assertEqual(self.second_rub.balance, Decimal("400.00"))
 
+    def test_processor_uses_total_fee_for_premium_sender_and_logs_fee_breakdown(self) -> None:
+        with patch.object(self.bank, "_current_hour", return_value=10):
+            premium_sender = self.bank.open_account(
+                self.third_client.client_id,
+                account_type="premium",
+                balance="200.00",
+                currency="RUB",
+                overdraft_limit="0.00",
+                fixed_commission="5.00",
+                single_withdrawal_limit="500.00",
+                account_id="C_PRM_02",
+            )
+        transaction = Transaction(
+            transaction_type=TransactionType.TRANSFER_EXTERNAL,
+            amount="100.00",
+            currency="RUB",
+            sender_account_id=premium_sender.account_id,
+            recipient_account_id=self.second_rub.account_id,
+        )
+
+        processed_transaction = self.processor.process_transaction(transaction, now=datetime(2026, 4, 16, 12, 0, tzinfo=timezone.utc))
+
+        self.assertEqual(processed_transaction.status, TransactionStatus.COMPLETED)
+        self.assertEqual(processed_transaction.fee, Decimal("15.00"))
+        self.assertEqual(premium_sender.balance, Decimal("85.00"))
+        completed_events = self.bank.audit_log.filter_events(
+            event_type="transaction_completed",
+            transaction_id=transaction.transaction_id,
+        )
+        self.assertEqual(len(completed_events), 1)
+        self.assertEqual(completed_events[0].metadata["processor_fee"], "10.00")
+        self.assertEqual(completed_events[0].metadata["account_fee"], "5.00")
+        self.assertEqual(completed_events[0].metadata["total_fee"], "15.00")
+        self.assertEqual(completed_events[0].metadata["sender_total_charge"], "115.00")
+
     def test_processor_marks_retrying_for_temporary_errors(self) -> None:
         transaction = Transaction(
             transaction_type=TransactionType.TRANSFER_INTERNAL,
@@ -1121,6 +1156,40 @@ class ReportBuilderTestCase(unittest.TestCase):
                 if isinstance(event.get("metadata"), dict)
             )
         )
+
+    def test_client_balance_timeline_uses_actual_premium_sender_charge(self) -> None:
+        with patch.object(self.bank, "_current_hour", return_value=10):
+            premium_sender = self.bank.open_account(
+                self.first_client.client_id,
+                account_type="premium",
+                balance="200.00",
+                currency="RUB",
+                overdraft_limit="0.00",
+                fixed_commission="5.00",
+                single_withdrawal_limit="500.00",
+                account_id="RB_PRM_03",
+            )
+        premium_transaction = Transaction(
+            transaction_type=TransactionType.TRANSFER_EXTERNAL,
+            amount="100.00",
+            currency="RUB",
+            sender_account_id=premium_sender.account_id,
+            recipient_account_id=self.second_rub.account_id,
+        )
+
+        self.second_rub.activate()
+        self.processor.process_transaction(premium_transaction, now=datetime(2026, 4, 18, 10, 0, tzinfo=timezone.utc))
+        timeline = self.report_builder._build_client_balance_timeline(self.first_client.client_id)
+        current_index = timeline["labels"].index("current")
+
+        self.assertEqual(timeline["series"]["RUB"][current_index], 975.0)
+        self.assertEqual(timeline["series"]["RUB"][current_index - 1] - timeline["series"]["RUB"][current_index], 115.0)
+        completed_events = self.bank.audit_log.filter_events(
+            event_type="transaction_completed",
+            transaction_id=premium_transaction.transaction_id,
+        )
+        self.assertEqual(len(completed_events), 1)
+        self.assertEqual(completed_events[0].metadata["sender_total_charge"], "115.00")
 
     def test_build_bank_report_contains_totals_rankings_and_statistics(self) -> None:
         report = self.report_builder.build_bank_report()
