@@ -1,16 +1,22 @@
 
+import asyncio
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 import json
 from pathlib import Path
+import socket
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
+
+from aiohttp import web
 
 from src.models import (
     AccountClosedError,
     AccountFrozenError,
     AccountStatus,
+    AsyncCrawler,
     BankAccount,
     Bank,
     Client,
@@ -30,7 +36,7 @@ from src.models import (
     TransactionStatus,
     TransactionType,
 )
-from src.main import build_demo_bank, generate_report_artifacts
+from src.main import build_demo_bank, fetch_urls_sequentially, generate_report_artifacts, run_async_crawler_demo
 
 
 class BankAccountTestCase(unittest.TestCase):
@@ -1270,6 +1276,158 @@ class MainDemoIntegrationTestCase(unittest.TestCase):
         self.assertEqual(len(chart_paths), 5)
         self.assertTrue(all(Path(path).exists() for path in chart_paths))
         self.assertIn('"report_type": "risk"', str(artifacts["risk_preview"]))
+
+
+class AsyncCrawlerTestCase(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self) -> None:
+        app = web.Application()
+        app.router.add_get("/ok", self.handle_ok)
+        app.router.add_get("/json", self.handle_json)
+        app.router.add_get("/delay/{seconds}", self.handle_delay)
+        app.router.add_get("/status/{code}", self.handle_status)
+
+        self.runner = web.AppRunner(app)
+        await self.runner.setup()
+        self.site = web.TCPSite(self.runner, "127.0.0.1", 0)
+        await self.site.start()
+        sockets = self.site._server.sockets
+        self.port = sockets[0].getsockname()[1]
+        self.base_url = f"http://127.0.0.1:{self.port}"
+
+    async def asyncTearDown(self) -> None:
+        await self.runner.cleanup()
+
+    async def handle_ok(self, request: web.Request) -> web.Response:
+        return web.Response(text="example page")
+
+    async def handle_json(self, request: web.Request) -> web.Response:
+        return web.json_response(
+            {
+                "args": {},
+                "data": "",
+                "files": {},
+                "form": {},
+                "headers": {
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "Accept-Encoding": "deflate, gzip, br",
+                    "Accept-Language": "en-US,en;q=0.5",
+                    "Host": "httpbin.org",
+                    "User-Agent": "TelegramBot (like TwitterBot)",
+                    "X-Amzn-Trace-Id": "Root=1-69e0ec2a-3157742401cfc9343c7862d2",
+                },
+                "origin": "149.154.161.218",
+                "url": "https://httpbin.org/delay/1",
+            }
+        )
+
+    async def handle_delay(self, request: web.Request) -> web.Response:
+        delay_seconds = float(request.match_info["seconds"])
+        await asyncio.sleep(delay_seconds)
+        return web.Response(text=f"delayed {delay_seconds}")
+
+    async def handle_status(self, request: web.Request) -> web.Response:
+        status_code = int(request.match_info["code"])
+        return web.Response(status=status_code, text=f"status {status_code}")
+
+    async def test_fetch_url_returns_text_for_valid_url(self) -> None:
+        crawler = AsyncCrawler(max_concurrent=2)
+
+        content = await crawler.fetch_url(f"{self.base_url}/ok")
+        await crawler.close()
+
+        self.assertEqual(content, "example page")
+
+    async def test_fetch_urls_returns_all_requested_urls(self) -> None:
+        crawler = AsyncCrawler(max_concurrent=3)
+        urls = [
+            f"{self.base_url}/ok",
+            f"{self.base_url}/json",
+            f"{self.base_url}/status/404",
+        ]
+
+        results = await crawler.fetch_urls(urls)
+        await crawler.close()
+
+        self.assertEqual(set(results.keys()), set(urls))
+        self.assertIn("example page", results[f"{self.base_url}/ok"])
+        self.assertIn('"origin": "149.154.161.218"', results[f"{self.base_url}/json"])
+        self.assertEqual(results[f"{self.base_url}/status/404"], "")
+
+    async def test_fetch_url_returns_empty_string_for_unreachable_url(self) -> None:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind(("127.0.0.1", 0))
+            unused_port = sock.getsockname()[1]
+        crawler = AsyncCrawler(max_concurrent=1)
+
+        content = await crawler.fetch_url(f"http://127.0.0.1:{unused_port}/missing")
+        await crawler.close()
+
+        self.assertEqual(content, "")
+
+    async def test_fetch_url_returns_empty_string_on_timeout(self) -> None:
+        crawler = AsyncCrawler(max_concurrent=1, read_timeout=0.05, total_timeout=0.1)
+
+        content = await crawler.fetch_url(f"{self.base_url}/delay/0.2")
+        await crawler.close()
+
+        self.assertEqual(content, "")
+
+    async def test_parallel_fetch_is_faster_than_sequential(self) -> None:
+        urls = [f"{self.base_url}/delay/0.2?run={index}" for index in range(5)]
+        parallel_crawler = AsyncCrawler(max_concurrent=5)
+        sequential_crawler = AsyncCrawler(max_concurrent=1)
+
+        parallel_started_at = time.perf_counter()
+        parallel_results = await parallel_crawler.fetch_urls(urls)
+        parallel_time = time.perf_counter() - parallel_started_at
+
+        sequential_started_at = time.perf_counter()
+        sequential_results = await fetch_urls_sequentially(sequential_crawler, urls)
+        sequential_time = time.perf_counter() - sequential_started_at
+
+        await parallel_crawler.close()
+        await sequential_crawler.close()
+
+        self.assertTrue(all(content for content in parallel_results.values()))
+        self.assertTrue(all(content for content in sequential_results.values()))
+        self.assertLess(parallel_time, sequential_time)
+
+    async def test_logging_reports_start_success_and_error(self) -> None:
+        crawler = AsyncCrawler(max_concurrent=2)
+
+        with self.assertLogs("src.models", level="INFO") as captured_logs:
+            await crawler.fetch_url(f"{self.base_url}/ok")
+            await crawler.fetch_url(f"{self.base_url}/status/500")
+        await crawler.close()
+
+        joined_logs = "\n".join(captured_logs.output)
+        self.assertIn("Starting download", joined_logs)
+        self.assertIn("Completed download", joined_logs)
+        self.assertIn("HTTP error", joined_logs)
+
+    async def test_run_async_crawler_demo_returns_expected_shape(self) -> None:
+        original_fetch_urls = AsyncCrawler.fetch_urls
+        original_fetch_url = AsyncCrawler.fetch_url
+
+        async def fake_fetch_urls(self, urls: list[str]) -> dict[str, str]:
+            return {url: f"payload:{index}" for index, url in enumerate(urls)}
+
+        async def fake_fetch_url(self, url: str) -> str:
+            return f"payload:{url}"
+
+        AsyncCrawler.fetch_urls = fake_fetch_urls
+        AsyncCrawler.fetch_url = fake_fetch_url
+        try:
+            result = await run_async_crawler_demo()
+        finally:
+            AsyncCrawler.fetch_urls = original_fetch_urls
+            AsyncCrawler.fetch_url = original_fetch_url
+
+        self.assertEqual(len(list(result["urls"])), 6)
+        self.assertEqual(set(dict(result["parallel_results"]).keys()), set(result["urls"]))
+        self.assertEqual(set(dict(result["sequential_results"]).keys()), set(result["urls"]))
+        self.assertGreaterEqual(float(result["parallel_elapsed"]), 0)
+        self.assertGreaterEqual(float(result["sequential_elapsed"]), 0)
 
 
 if __name__ == "__main__":

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from abc import ABC, abstractmethod
 import csv
 from dataclasses import dataclass, field
@@ -7,12 +8,18 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from enum import Enum
 import json
+import logging
 from pathlib import Path
 from uuid import uuid4
+
+import aiohttp
 
 
 TWOPLACES = Decimal("0.01")
 INVESTMENT_ASSET_TYPES = ("stocks", "bonds", "etf")
+
+
+logger = logging.getLogger(__name__)
 
 
 def _utc_now() -> datetime:
@@ -2179,3 +2186,80 @@ class TransactionProcessor:
             if all(transaction.status != TransactionStatus.RETRYING for transaction in processed_transactions):
                 break
         return processed_transactions
+
+
+class AsyncCrawler:
+    def __init__(
+        self,
+        max_concurrent: int = 10,
+        connect_timeout: float = 5,
+        read_timeout: float = 10,
+        total_timeout: float = 15,
+    ) -> None:
+        if not isinstance(max_concurrent, int) or max_concurrent < 1:
+            raise InvalidOperationError("max_concurrent must be a positive integer")
+        self.max_concurrent = max_concurrent
+        self._timeout = aiohttp.ClientTimeout(
+            total=total_timeout,
+            connect=connect_timeout,
+            sock_read=read_timeout,
+        )
+        self._semaphore = asyncio.Semaphore(max_concurrent)
+        self._session: aiohttp.ClientSession | None = None
+
+    async def _ensure_session(self) -> aiohttp.ClientSession:
+        if self._session is None or self._session.closed:
+            connector = aiohttp.TCPConnector(
+                limit=self.max_concurrent,
+                limit_per_host=self.max_concurrent,
+                ttl_dns_cache=300,
+            )
+            self._session = aiohttp.ClientSession(
+                timeout=self._timeout,
+                connector=connector,
+                headers={"User-Agent": "AsyncCrawler/1.0"},
+            )
+        return self._session
+
+    @staticmethod
+    def _is_supported_url(url: str) -> bool:
+        return isinstance(url, str) and url.startswith(("http://", "https://"))
+
+    async def fetch_url(self, url: str) -> str:
+        if not self._is_supported_url(url):
+            logger.warning("Unsupported URL skipped: %s", url)
+            return ""
+
+        async with self._semaphore:
+            logger.info("Starting download: %s", url)
+            try:
+                session = await self._ensure_session()
+                async with session.get(url) as response:
+                    response.raise_for_status()
+                    content = await response.text()
+                    logger.info("Completed download: %s", url)
+                    return content
+            except aiohttp.ClientResponseError as error:
+                logger.warning("HTTP error for %s: %s", url, error)
+            except asyncio.TimeoutError as error:
+                logger.warning("Timeout error for %s: %s", url, error)
+            except aiohttp.ClientError as error:
+                logger.warning("Network error for %s: %s", url, error)
+            return ""
+
+    async def fetch_urls(self, urls: list[str]) -> dict[str, str]:
+        tasks = [self.fetch_url(url) for url in urls]
+        results = await asyncio.gather(*tasks)
+        return dict(zip(urls, results, strict=False))
+
+    async def close(self) -> None:
+        if self._session is not None and not self._session.closed:
+            await self._session.close()
+        self._session = None
+
+    async def __aenter__(self) -> AsyncCrawler:
+        await self._ensure_session()
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        await self.close()

@@ -4,11 +4,13 @@ from collections import Counter
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import tempfile
+from time import perf_counter
 from typing import Callable
 
 try:
     from .models import (
         AbstractAccount,
+        AsyncCrawler,
         Bank,
         Client,
         InvalidOperationError,
@@ -23,6 +25,7 @@ try:
 except ImportError:
     from models import (
         AbstractAccount,
+        AsyncCrawler,
         Bank,
         Client,
         InvalidOperationError,
@@ -575,6 +578,68 @@ def show_reports(
     print(f"Transactions: {len(transactions)}")
     print(f"Audit events captured: {len(bank.audit_log.events)}")
     print(f"Audit JSONL file: {audit_log_path}")
+
+
+async def fetch_urls_sequentially(crawler: AsyncCrawler, urls: list[str]) -> dict[str, str]:
+    results: dict[str, str] = {}
+    for url in urls:
+        results[url] = await crawler.fetch_url(url)
+    return results
+
+
+async def run_async_crawler_demo() -> dict[str, object]:
+    urls = [
+        "https://example.com",
+        "https://httpbin.org/get",
+        "https://httpbin.org/delay/1",
+        "https://httpbin.org/delay/2",
+        "https://www.python.org",
+        "https://httpbin.org/status/404",
+    ]
+    parallel_crawler = AsyncCrawler(max_concurrent=5)
+    sequential_crawler = AsyncCrawler(max_concurrent=1)
+    parallel_results: dict[str, str] = {}
+    sequential_results: dict[str, str] = {}
+    parallel_elapsed = 0.0
+    sequential_elapsed = 0.0
+    try:
+        parallel_started_at = perf_counter()
+        parallel_results = await parallel_crawler.fetch_urls(urls)
+        parallel_elapsed = perf_counter() - parallel_started_at
+
+        sequential_started_at = perf_counter()
+        sequential_results = await fetch_urls_sequentially(sequential_crawler, urls)
+        sequential_elapsed = perf_counter() - sequential_started_at
+    finally:
+        await parallel_crawler.close()
+        await sequential_crawler.close()
+    return {
+        "urls": urls,
+        "parallel_results": parallel_results,
+        "sequential_results": sequential_results,
+        "parallel_elapsed": parallel_elapsed,
+        "sequential_elapsed": sequential_elapsed,
+    }
+
+
+def print_async_crawler_demo_summary(result: dict[str, object]) -> None:
+    print_section("ASYNC CRAWLER DEMONSTRATION")
+    parallel_results = dict(result["parallel_results"])
+    sequential_results = dict(result["sequential_results"])
+    print("Parallel fetch results:")
+    for url, content in parallel_results.items():
+        status = "OK" if content else "ERROR"
+        print(f"  - {status} | bytes={len(content)} | url={url}")
+    print("Sequential fetch results:")
+    for url, content in sequential_results.items():
+        status = "OK" if content else "ERROR"
+        print(f"  - {status} | bytes={len(content)} | url={url}")
+    parallel_elapsed = float(result["parallel_elapsed"])
+    sequential_elapsed = float(result["sequential_elapsed"])
+    print(f"Parallel time: {parallel_elapsed:.2f}s")
+    print(f"Sequential time: {sequential_elapsed:.2f}s")
+    if parallel_elapsed > 0:
+        print(f"Speedup: {sequential_elapsed / parallel_elapsed:.2f}x")
 
 
 def main() -> None:
