@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import Counter
 from datetime import datetime, timedelta, timezone
+import json
 from pathlib import Path
 import tempfile
 from time import perf_counter
@@ -13,6 +14,7 @@ try:
         AsyncCrawler,
         Bank,
         Client,
+        HTMLParser,
         InvalidOperationError,
         ReportBuilder,
         RiskLevel,
@@ -28,6 +30,7 @@ except ImportError:
         AsyncCrawler,
         Bank,
         Client,
+        HTMLParser,
         InvalidOperationError,
         ReportBuilder,
         RiskLevel,
@@ -640,6 +643,58 @@ def print_async_crawler_demo_summary(result: dict[str, object]) -> None:
     print(f"Sequential time: {sequential_elapsed:.2f}s")
     if parallel_elapsed > 0:
         print(f"Speedup: {sequential_elapsed / parallel_elapsed:.2f}x")
+
+
+async def run_html_parser_demo() -> dict[str, object]:
+    urls = [
+        "https://example.com",
+        "https://httpbin.org/html",
+        "https://www.python.org",
+    ]
+    crawler = AsyncCrawler(max_concurrent=3, html_parser=HTMLParser())
+    parsed_pages: list[dict[str, object]] = []
+    started_at = perf_counter()
+    try:
+        for url in urls:
+            parsed_pages.append(await crawler.fetch_and_parse(url))
+    finally:
+        await crawler.close()
+    elapsed = perf_counter() - started_at
+    output_dir = Path(tempfile.gettempdir()) / "dj_vy_html_parser_demo"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = output_dir / "parsed_pages.json"
+    output_payload = []
+    summary = []
+    for page in parsed_pages:
+        page_summary = {
+            "url": str(page["url"]),
+            "title": str(page["title"]),
+            "text_length": len(str(page["text"])),
+            "links_count": len(list(page["links"])),
+            "links": list(page["links"]),
+            "images_count": len(list(page["images"])),
+        }
+        output_payload.append(page)
+        summary.append(page_summary)
+    output_path.write_text(json.dumps(output_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return {
+        "urls": urls,
+        "parsed_pages": parsed_pages,
+        "summary": summary,
+        "elapsed": elapsed,
+        "output_path": str(output_path),
+    }
+
+
+def print_html_parser_demo_summary(result: dict[str, object]) -> None:
+    print_section("HTML PARSER DEMONSTRATION")
+    print(f"Output JSON: {result['output_path']}")
+    print(f"Elapsed: {float(result['elapsed']):.2f}s")
+    for item in list(result["summary"]):
+        print(
+            f"- url={item['url']} | title={item['title']} | text_length={item['text_length']} | "
+            f"links_count={item['links_count']} | images_count={item['images_count']}"
+        )
 
 
 def main() -> None:

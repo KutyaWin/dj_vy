@@ -1,5 +1,6 @@
 
 import asyncio
+from bs4 import BeautifulSoup
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 import json
@@ -23,6 +24,7 @@ from src.models import (
     ClientStatus,
     Currency,
     InvestmentAccount,
+    HTMLParser,
     InsufficientFundsError,
     InvalidOperationError,
     Owner,
@@ -36,7 +38,7 @@ from src.models import (
     TransactionStatus,
     TransactionType,
 )
-from src.main import build_demo_bank, fetch_urls_sequentially, generate_report_artifacts, run_async_crawler_demo
+from src.main import build_demo_bank, fetch_urls_sequentially, generate_report_artifacts, run_async_crawler_demo, run_html_parser_demo
 
 
 class BankAccountTestCase(unittest.TestCase):
@@ -1278,11 +1280,108 @@ class MainDemoIntegrationTestCase(unittest.TestCase):
         self.assertIn('"report_type": "risk"', str(artifacts["risk_preview"]))
 
 
+class HTMLParserTestCase(unittest.IsolatedAsyncioTestCase):
+    async def test_parse_html_extracts_expected_fields(self) -> None:
+        parser = HTMLParser()
+        html = """
+        <html>
+            <head>
+                <title>Example Domain</title>
+                <meta name="description" content="Example description">
+                <meta name="keywords" content="example, domain">
+            </head>
+            <body>
+                <h1>Main title</h1>
+                <h2>Section title</h2>
+                <p>Hello <strong>world</strong></p>
+                <a href="/about">About</a>
+                <a href="https://external.example.org/page">External</a>
+                <img src="/static/logo.png" alt="Logo">
+                <table>
+                    <tr><th>Name</th><th>Value</th></tr>
+                    <tr><td>Alpha</td><td>1</td></tr>
+                </table>
+                <ul><li>One</li><li>Two</li></ul>
+            </body>
+        </html>
+        """
+
+        result = await parser.parse_html(html, "https://example.com/start")
+
+        self.assertEqual(result["title"], "Example Domain")
+        self.assertEqual(dict(result["metadata"])["description"], "Example description")
+        self.assertEqual(dict(result["metadata"])["keywords"], "example, domain")
+        self.assertIn("Hello world", str(result["text"]))
+        self.assertEqual(list(result["links"]), ["https://example.com/about", "https://external.example.org/page"])
+        self.assertEqual(list(result["images"]), [{"src": "https://example.com/static/logo.png", "alt": "Logo"}])
+        self.assertEqual(list(result["headings"]), [{"tag": "h1", "text": "Main title"}, {"tag": "h2", "text": "Section title"}])
+        self.assertEqual(list(result["tables"]), [[ ["Name", "Value"], ["Alpha", "1"] ]])
+        self.assertEqual(list(result["lists"]), [{"type": "ul", "items": ["One", "Two"]}])
+
+    async def test_parse_html_handles_broken_html_without_raising(self) -> None:
+        parser = HTMLParser()
+        html = "<html><head><title>Broken<title><body><h1>Oops<p><a href='/x'>go"
+
+        result = await parser.parse_html(html, "https://example.com")
+
+        self.assertEqual(result["url"], "https://example.com")
+        self.assertIn("Oops", str(result["text"]))
+        self.assertIn("https://example.com/x", list(result["links"]))
+
+    def test_extract_links_converts_relative_urls_and_filters_invalid(self) -> None:
+        parser = HTMLParser()
+        soup = BeautifulSoup(
+            """
+            <html><body>
+                <a href="/relative">Relative</a>
+                <a href="contact">Contact</a>
+                <a href="#fragment">Fragment</a>
+                <a href="mailto:test@example.com">Mail</a>
+                <a href="javascript:void(0)">JS</a>
+                <a href="https://example.com/absolute">Absolute</a>
+            </body></html>
+            """,
+            "html.parser",
+        )
+
+        links = parser.extract_links(soup, "https://example.com/base/index.html")
+
+        self.assertEqual(
+            links,
+            [
+                "https://example.com/relative",
+                "https://example.com/base/contact",
+                "https://example.com/absolute",
+            ],
+        )
+
+    def test_extract_links_can_limit_to_same_domain(self) -> None:
+        parser = HTMLParser(same_domain_only=True)
+        soup = BeautifulSoup(
+            '<a href="/docs">Docs</a><a href="https://other.example.org/page">External</a>',
+            "html.parser",
+        )
+
+        links = parser.extract_links(soup, "https://example.com/start")
+
+        self.assertEqual(links, ["https://example.com/docs"])
+
+    def test_extract_text_with_selector_returns_scoped_text(self) -> None:
+        parser = HTMLParser()
+        soup = BeautifulSoup('<body><main><p>Target text</p></main><footer>Ignore me</footer></body>', "html.parser")
+
+        text = parser.extract_text(soup, "main")
+
+        self.assertEqual(text, "Target text")
+
+
 class AsyncCrawlerTestCase(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         app = web.Application()
         app.router.add_get("/ok", self.handle_ok)
         app.router.add_get("/json", self.handle_json)
+        app.router.add_get("/html", self.handle_html)
+        app.router.add_get("/broken-html", self.handle_broken_html)
         app.router.add_get("/delay/{seconds}", self.handle_delay)
         app.router.add_get("/status/{code}", self.handle_status)
 
@@ -1319,6 +1418,22 @@ class AsyncCrawlerTestCase(unittest.IsolatedAsyncioTestCase):
                 "url": "https://httpbin.org/delay/1",
             }
         )
+
+    async def handle_html(self, request: web.Request) -> web.Response:
+        return web.Response(
+            text=(
+                "<html><head><title>Parser Page</title>"
+                "<meta name='description' content='Parser description'>"
+                "<meta name='keywords' content='parser, test'></head>"
+                "<body><h1>Heading</h1><p>Body text</p><a href='/next'>Next</a>"
+                "<img src='/image.png' alt='Image alt'><table><tr><td>A</td></tr></table>"
+                "<ol><li>First</li></ol></body></html>"
+            ),
+            content_type="text/html",
+        )
+
+    async def handle_broken_html(self, request: web.Request) -> web.Response:
+        return web.Response(text="<html><head><title>Broken<title><body><a href='/oops'>Oops", content_type="text/html")
 
     async def handle_delay(self, request: web.Request) -> web.Response:
         delay_seconds = float(request.match_info["seconds"])
@@ -1405,6 +1520,51 @@ class AsyncCrawlerTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Completed download", joined_logs)
         self.assertIn("HTTP error", joined_logs)
 
+    async def test_fetch_and_parse_returns_parsed_page_data(self) -> None:
+        crawler = AsyncCrawler(max_concurrent=2)
+
+        result = await crawler.fetch_and_parse(f"{self.base_url}/html")
+        await crawler.close()
+
+        self.assertEqual(result["title"], "Parser Page")
+        self.assertIn("Body text", str(result["text"]))
+        self.assertEqual(list(result["links"]), [f"{self.base_url}/next"])
+        self.assertEqual(list(result["images"]), [{"src": f"{self.base_url}/image.png", "alt": "Image alt"}])
+        self.assertEqual(dict(result["metadata"])["description"], "Parser description")
+        self.assertEqual(list(result["headings"]), [{"tag": "h1", "text": "Heading"}])
+        self.assertEqual(list(result["tables"]), [[["A"]]])
+        self.assertEqual(list(result["lists"]), [{"type": "ol", "items": ["First"]}])
+
+    async def test_fetch_and_parse_returns_partial_result_for_invalid_page(self) -> None:
+        crawler = AsyncCrawler(max_concurrent=2)
+
+        result = await crawler.fetch_and_parse(f"{self.base_url}/status/404")
+        await crawler.close()
+
+        self.assertEqual(
+            result,
+            {
+                "url": f"{self.base_url}/status/404",
+                "title": "",
+                "text": "",
+                "links": [],
+                "metadata": {},
+                "images": [],
+                "headings": [],
+                "tables": [],
+                "lists": [],
+            },
+        )
+
+    async def test_fetch_and_parse_handles_broken_html(self) -> None:
+        crawler = AsyncCrawler(max_concurrent=2)
+
+        result = await crawler.fetch_and_parse(f"{self.base_url}/broken-html")
+        await crawler.close()
+
+        self.assertEqual(result["title"], "Broken")
+        self.assertIn(f"{self.base_url}/oops", list(result["links"]))
+
     async def test_run_async_crawler_demo_returns_expected_shape(self) -> None:
         original_fetch_urls = AsyncCrawler.fetch_urls
         original_fetch_url = AsyncCrawler.fetch_url
@@ -1428,6 +1588,36 @@ class AsyncCrawlerTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(set(dict(result["sequential_results"]).keys()), set(result["urls"]))
         self.assertGreaterEqual(float(result["parallel_elapsed"]), 0)
         self.assertGreaterEqual(float(result["sequential_elapsed"]), 0)
+
+    async def test_run_html_parser_demo_writes_json_output(self) -> None:
+        original_fetch_and_parse = AsyncCrawler.fetch_and_parse
+
+        async def fake_fetch_and_parse(self, url: str) -> dict[str, object]:
+            return {
+                "url": url,
+                "title": f"Title for {url}",
+                "text": "hello world",
+                "links": [f"{url}/next"],
+                "metadata": {"title": f"Title for {url}", "description": "demo", "keywords": "test"},
+                "images": [{"src": f"{url}/image.png", "alt": "alt"}],
+                "headings": [{"tag": "h1", "text": "Heading"}],
+                "tables": [[["col"]]],
+                "lists": [{"type": "ul", "items": ["item"]}],
+            }
+
+        AsyncCrawler.fetch_and_parse = fake_fetch_and_parse
+        try:
+            result = await run_html_parser_demo()
+        finally:
+            AsyncCrawler.fetch_and_parse = original_fetch_and_parse
+
+        output_path = Path(str(result["output_path"]))
+        self.assertTrue(output_path.exists())
+        payload = json.loads(output_path.read_text(encoding="utf-8"))
+        self.assertEqual(len(payload), 3)
+        self.assertEqual(len(list(result["summary"])), 3)
+        self.assertEqual(dict(enumerate(list(result["summary"])))[0]["links_count"], 1)
+        self.assertEqual(dict(enumerate(list(result["summary"])))[0]["images_count"], 1)
 
 
 if __name__ == "__main__":

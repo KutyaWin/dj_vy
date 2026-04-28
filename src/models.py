@@ -10,9 +10,11 @@ from enum import Enum
 import json
 import logging
 from pathlib import Path
+from urllib.parse import urldefrag, urljoin, urlparse
 from uuid import uuid4
 
 import aiohttp
+from bs4 import BeautifulSoup
 
 
 TWOPLACES = Decimal("0.01")
@@ -2188,6 +2190,170 @@ class TransactionProcessor:
         return processed_transactions
 
 
+class HTMLParser:
+    def __init__(self, same_domain_only: bool = False) -> None:
+        self.same_domain_only = same_domain_only
+
+    @staticmethod
+    def empty_result(url: str) -> dict[str, object]:
+        return {
+            "url": url,
+            "title": "",
+            "text": "",
+            "links": [],
+            "metadata": {},
+            "images": [],
+            "headings": [],
+            "tables": [],
+            "lists": [],
+        }
+
+    @staticmethod
+    def _normalize_text(value: str) -> str:
+        return " ".join(value.split())
+
+    @staticmethod
+    def _is_valid_absolute_url(url: str) -> bool:
+        parsed = urlparse(url)
+        return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+
+    def _normalize_url(self, candidate: str, base_url: str) -> str:
+        if not isinstance(candidate, str) or not candidate.strip():
+            return ""
+        normalized_candidate = candidate.strip()
+        lowered_candidate = normalized_candidate.lower()
+        if lowered_candidate.startswith(("javascript:", "mailto:", "tel:")):
+            return ""
+        if normalized_candidate.startswith("#"):
+            return ""
+        normalized_url, _fragment = urldefrag(urljoin(base_url, normalized_candidate))
+        if not self._is_valid_absolute_url(normalized_url):
+            return ""
+        if self.same_domain_only and urlparse(normalized_url).netloc != urlparse(base_url).netloc:
+            return ""
+        return normalized_url
+
+    def extract_links(self, soup: BeautifulSoup, base_url: str) -> list[str]:
+        unique_links: list[str] = []
+        seen_links: set[str] = set()
+        for tag in soup.find_all("a", href=True):
+            normalized_url = self._normalize_url(str(tag.get("href", "")), base_url)
+            if not normalized_url or normalized_url in seen_links:
+                continue
+            seen_links.add(normalized_url)
+            unique_links.append(normalized_url)
+        return unique_links
+
+    def extract_text(self, soup: BeautifulSoup, selector: str = None) -> str:
+        try:
+            target = soup.select_one(selector) if selector else (soup.body or soup)
+        except Exception as error:
+            logger.warning("Text extraction failed for selector %s: %s", selector, error)
+            return ""
+        if target is None:
+            return ""
+        return self._normalize_text(target.get_text(" ", strip=True))
+
+    def extract_metadata(self, soup: BeautifulSoup) -> dict[str, str]:
+        title = ""
+        if soup.title is not None:
+            title = self._normalize_text(next(soup.title.stripped_strings, ""))
+        description_tag = soup.find("meta", attrs={"name": lambda value: isinstance(value, str) and value.lower() == "description"})
+        keywords_tag = soup.find("meta", attrs={"name": lambda value: isinstance(value, str) and value.lower() == "keywords"})
+        return {
+            "title": title,
+            "description": self._normalize_text(str(description_tag.get("content", ""))) if description_tag else "",
+            "keywords": self._normalize_text(str(keywords_tag.get("content", ""))) if keywords_tag else "",
+        }
+
+    def extract_images(self, soup: BeautifulSoup, base_url: str) -> list[dict[str, str]]:
+        images: list[dict[str, str]] = []
+        for image in soup.find_all("img"):
+            normalized_src = self._normalize_url(str(image.get("src", "")), base_url)
+            if not normalized_src:
+                continue
+            images.append(
+                {
+                    "src": normalized_src,
+                    "alt": self._normalize_text(str(image.get("alt", ""))),
+                }
+            )
+        return images
+
+    def extract_headings(self, soup: BeautifulSoup) -> list[dict[str, str]]:
+        headings: list[dict[str, str]] = []
+        for tag in soup.find_all(["h1", "h2", "h3"]):
+            text = self._normalize_text(tag.get_text(" ", strip=True))
+            if not text:
+                continue
+            headings.append({"tag": tag.name, "text": text})
+        return headings
+
+    def extract_tables(self, soup: BeautifulSoup) -> list[list[list[str]]]:
+        tables: list[list[list[str]]] = []
+        for table in soup.find_all("table"):
+            rows: list[list[str]] = []
+            for row in table.find_all("tr"):
+                cells = [self._normalize_text(cell.get_text(" ", strip=True)) for cell in row.find_all(["th", "td"])]
+                cells = [cell for cell in cells if cell]
+                if cells:
+                    rows.append(cells)
+            if rows:
+                tables.append(rows)
+        return tables
+
+    def extract_lists(self, soup: BeautifulSoup) -> list[dict[str, object]]:
+        lists: list[dict[str, object]] = []
+        for list_tag in soup.find_all(["ul", "ol"]):
+            items = [self._normalize_text(item.get_text(" ", strip=True)) for item in list_tag.find_all("li")]
+            items = [item for item in items if item]
+            if items:
+                lists.append({"type": list_tag.name, "items": items})
+        return lists
+
+    async def parse_html(self, html: str, url: str) -> dict[str, object]:
+        result = self.empty_result(url)
+        if not isinstance(html, str) or not html:
+            logger.warning("Empty or invalid HTML received for %s", url)
+            return result
+        try:
+            soup = BeautifulSoup(html, "html.parser")
+        except Exception as error:
+            logger.warning("Failed to parse HTML for %s: %s", url, error)
+            return result
+        try:
+            metadata = self.extract_metadata(soup)
+            result["metadata"] = metadata
+            result["title"] = metadata.get("title", "")
+        except Exception as error:
+            logger.warning("Metadata extraction failed for %s: %s", url, error)
+        try:
+            result["text"] = self.extract_text(soup)
+        except Exception as error:
+            logger.warning("Text extraction failed for %s: %s", url, error)
+        try:
+            result["links"] = self.extract_links(soup, url)
+        except Exception as error:
+            logger.warning("Link extraction failed for %s: %s", url, error)
+        try:
+            result["images"] = self.extract_images(soup, url)
+        except Exception as error:
+            logger.warning("Image extraction failed for %s: %s", url, error)
+        try:
+            result["headings"] = self.extract_headings(soup)
+        except Exception as error:
+            logger.warning("Heading extraction failed for %s: %s", url, error)
+        try:
+            result["tables"] = self.extract_tables(soup)
+        except Exception as error:
+            logger.warning("Table extraction failed for %s: %s", url, error)
+        try:
+            result["lists"] = self.extract_lists(soup)
+        except Exception as error:
+            logger.warning("List extraction failed for %s: %s", url, error)
+        return result
+
+
 class AsyncCrawler:
     def __init__(
         self,
@@ -2195,6 +2361,7 @@ class AsyncCrawler:
         connect_timeout: float = 5,
         read_timeout: float = 10,
         total_timeout: float = 15,
+        html_parser: HTMLParser | None = None,
     ) -> None:
         if not isinstance(max_concurrent, int) or max_concurrent < 1:
             raise InvalidOperationError("max_concurrent must be a positive integer")
@@ -2206,6 +2373,7 @@ class AsyncCrawler:
         )
         self._semaphore = asyncio.Semaphore(max_concurrent)
         self._session: aiohttp.ClientSession | None = None
+        self.html_parser = html_parser if html_parser is not None else HTMLParser()
 
     async def _ensure_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -2250,7 +2418,13 @@ class AsyncCrawler:
     async def fetch_urls(self, urls: list[str]) -> dict[str, str]:
         tasks = [self.fetch_url(url) for url in urls]
         results = await asyncio.gather(*tasks)
-        return dict(zip(urls, results, strict=False))
+        return dict(zip(urls, results))
+
+    async def fetch_and_parse(self, url: str) -> dict[str, object]:
+        html = await self.fetch_url(url)
+        if not html:
+            return self.html_parser.empty_result(url)
+        return await self.html_parser.parse_html(html, url)
 
     async def close(self) -> None:
         if self._session is not None and not self._session.closed:
