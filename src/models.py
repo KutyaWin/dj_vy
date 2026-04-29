@@ -296,7 +296,7 @@ class AbstractAccount(ABC):
     @staticmethod
     def _normalize_rate(rate: Decimal | int | float | str) -> Decimal:
         normalized_rate = AbstractAccount._normalize_amount(rate, allow_zero=True)
-        return (normalized_rate / Decimal("100")).quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
+        return normalized_rate.quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
 
 
 class BankAccount(AbstractAccount):

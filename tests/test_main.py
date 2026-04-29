@@ -176,7 +176,7 @@ class BankAccountTestCase(unittest.TestCase):
             owner=self.owner,
             balance="1000.00",
             min_balance="100.00",
-            monthly_interest_rate="5",
+            monthly_interest_rate="0.05",
             currency="USD",
         )
 
@@ -185,6 +185,18 @@ class BankAccountTestCase(unittest.TestCase):
         self.assertEqual(new_balance, Decimal("1050.00"))
         self.assertIn("monthly_interest_rate", account.get_account_info())
         self.assertIn("SavingsAccount", str(account))
+
+    def test_savings_account_rate_uses_fractional_contract(self) -> None:
+        account = SavingsAccount(
+            owner=self.owner,
+            balance="100.00",
+            min_balance="0.00",
+            monthly_interest_rate="0.01",
+            currency="USD",
+        )
+
+        self.assertEqual(account.monthly_interest_rate, Decimal("0.0100"))
+        self.assertEqual(account.get_account_info()["monthly_interest_rate"], "1.00%")
 
     def test_savings_account_respects_min_balance(self) -> None:
         account = SavingsAccount(
@@ -233,12 +245,24 @@ class BankAccountTestCase(unittest.TestCase):
             portfolio={"stocks": "1000.00", "bonds": "500.00", "etf": "500.00"},
         )
 
-        projected_value = account.project_yearly_growth("10")
+        projected_value = account.project_yearly_growth("0.10")
 
         self.assertEqual(projected_value, Decimal("2200.00"))
         info = account.get_account_info()
         self.assertEqual(info["portfolio_total"], "2000.00")
         self.assertIn("InvestmentAccount", str(account))
+
+    def test_investment_account_growth_rate_uses_fractional_contract(self) -> None:
+        account = InvestmentAccount(
+            owner=self.owner,
+            balance="0.00",
+            currency="USD",
+            portfolio={"stocks": "1000.00", "bonds": "0.00", "etf": "0.00"},
+        )
+
+        projected_value = account.project_yearly_growth("0.10")
+
+        self.assertEqual(projected_value, Decimal("1100.00"))
 
     def test_investment_account_can_withdraw_from_cash_and_portfolio(self) -> None:
         account = InvestmentAccount(
@@ -296,7 +320,7 @@ class BankManagerTestCase(unittest.TestCase):
             account_type="savings",
             balance="500.00",
             min_balance="50.00",
-            monthly_interest_rate="3",
+            monthly_interest_rate="0.03",
         )
 
         self.assertIsInstance(bank_account, BankAccount)
