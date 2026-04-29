@@ -22,6 +22,7 @@ from src.models import (
     Bank,
     Client,
     ClientStatus,
+    CrawlerQueue,
     Currency,
     InvestmentAccount,
     HTMLParser,
@@ -32,13 +33,14 @@ from src.models import (
     ReportBuilder,
     RiskLevel,
     SavingsAccount,
+    SemaphoreManager,
     Transaction,
     TransactionProcessor,
     TransactionQueue,
     TransactionStatus,
     TransactionType,
 )
-from src.main import build_demo_bank, fetch_urls_sequentially, generate_report_artifacts, run_async_crawler_demo, run_html_parser_demo
+from src.main import build_demo_bank, fetch_urls_sequentially, generate_report_artifacts, run_async_crawler_demo, run_html_parser_demo, run_site_crawl_demo
 
 
 class BankAccountTestCase(unittest.TestCase):
@@ -1399,6 +1401,58 @@ class HTMLParserTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(text, "Target text")
 
 
+class CrawlerQueueTestCase(unittest.IsolatedAsyncioTestCase):
+    async def test_queue_returns_urls_by_priority(self) -> None:
+        queue = CrawlerQueue()
+
+        await queue.add_url("https://example.com/low", priority=5)
+        await queue.add_url("https://example.com/high", priority=0)
+        await queue.add_url("https://example.com/mid", priority=2)
+
+        self.assertEqual(await queue.get_next(), "https://example.com/high")
+        queue.mark_processed("https://example.com/high")
+        self.assertEqual(await queue.get_next(), "https://example.com/mid")
+        queue.mark_processed("https://example.com/mid")
+        self.assertEqual(await queue.get_next(), "https://example.com/low")
+
+    async def test_queue_tracks_processed_failed_and_duplicates(self) -> None:
+        queue = CrawlerQueue()
+
+        self.assertTrue(await queue.add_url("https://example.com/page", depth=1))
+        self.assertFalse(await queue.add_url("https://example.com/page", depth=1))
+        self.assertEqual(queue.get_depth("https://example.com/page"), 1)
+        next_url = await queue.get_next()
+        self.assertEqual(next_url, "https://example.com/page")
+        queue.mark_failed("https://example.com/page", "boom")
+
+        stats = queue.get_stats()
+
+        self.assertEqual(stats["failed"], 1)
+        self.assertEqual(stats["processed"], 0)
+        self.assertFalse(await queue.add_url("https://example.com/page", depth=1))
+
+
+class SemaphoreManagerTestCase(unittest.IsolatedAsyncioTestCase):
+    async def test_semaphore_manager_tracks_active_tasks(self) -> None:
+        manager = SemaphoreManager(max_concurrent=2, per_domain_concurrent=1)
+        snapshots: list[dict[str, object]] = []
+
+        async def worker(url: str) -> None:
+            async with manager.limit(url):
+                snapshots.append(manager.get_stats())
+                await asyncio.sleep(0.01)
+
+        await asyncio.gather(
+            worker("https://example.com/1"),
+            worker("https://example.com/2"),
+            worker("https://other.example.org/1"),
+        )
+
+        self.assertTrue(any(int(snapshot["active_tasks"]) >= 1 for snapshot in snapshots))
+        self.assertTrue(all(int(dict(snapshot["active_by_domain"]).get("example.com", 0)) <= 1 for snapshot in snapshots))
+        self.assertEqual(manager.get_stats()["active_tasks"], 0)
+
+
 class AsyncCrawlerTestCase(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         app = web.Application()
@@ -1406,6 +1460,12 @@ class AsyncCrawlerTestCase(unittest.IsolatedAsyncioTestCase):
         app.router.add_get("/json", self.handle_json)
         app.router.add_get("/html", self.handle_html)
         app.router.add_get("/broken-html", self.handle_broken_html)
+        app.router.add_get("/crawl/root", self.handle_crawl_root)
+        app.router.add_get("/crawl/page-1", self.handle_crawl_page_1)
+        app.router.add_get("/crawl/page-2", self.handle_crawl_page_2)
+        app.router.add_get("/crawl/page-3", self.handle_crawl_page_3)
+        app.router.add_get("/crawl/skip-me", self.handle_crawl_skip_me)
+        app.router.add_get("/crawl/include-only", self.handle_crawl_include_only)
         app.router.add_get("/delay/{seconds}", self.handle_delay)
         app.router.add_get("/status/{code}", self.handle_status)
 
@@ -1458,6 +1518,54 @@ class AsyncCrawlerTestCase(unittest.IsolatedAsyncioTestCase):
 
     async def handle_broken_html(self, request: web.Request) -> web.Response:
         return web.Response(text="<html><head><title>Broken<title><body><a href='/oops'>Oops", content_type="text/html")
+
+    async def handle_crawl_root(self, request: web.Request) -> web.Response:
+        return web.Response(
+            text=(
+                f"<html><head><title>Root</title></head><body>"
+                f"<a href='/crawl/page-1'>Page 1</a>"
+                f"<a href='/crawl/page-2'>Page 2</a>"
+                f"<a href='/crawl/page-1'>Page 1 Duplicate</a>"
+                f"<a href='/crawl/include-only'>Include Only</a>"
+                f"<a href='/crawl/skip-me'>Skip Me</a>"
+                f"<a href='https://external.example.org/outside'>External</a>"
+                f"</body></html>"
+            ),
+            content_type="text/html",
+        )
+
+    async def handle_crawl_page_1(self, request: web.Request) -> web.Response:
+        return web.Response(
+            text=(
+                "<html><head><title>Page 1</title></head><body>"
+                "<a href='/crawl/page-3'>Page 3</a>"
+                "<a href='/crawl/page-2'>Page 2</a>"
+                "</body></html>"
+            ),
+            content_type="text/html",
+        )
+
+    async def handle_crawl_page_2(self, request: web.Request) -> web.Response:
+        return web.Response(
+            text=(
+                "<html><head><title>Page 2</title></head><body>"
+                "<a href='/crawl/page-3'>Page 3</a>"
+                "</body></html>"
+            ),
+            content_type="text/html",
+        )
+
+    async def handle_crawl_page_3(self, request: web.Request) -> web.Response:
+        return web.Response(
+            text="<html><head><title>Page 3</title></head><body><p>Leaf page</p></body></html>",
+            content_type="text/html",
+        )
+
+    async def handle_crawl_skip_me(self, request: web.Request) -> web.Response:
+        return web.Response(text="<html><head><title>Skip</title></head><body></body></html>", content_type="text/html")
+
+    async def handle_crawl_include_only(self, request: web.Request) -> web.Response:
+        return web.Response(text="<html><head><title>Include</title></head><body></body></html>", content_type="text/html")
 
     async def handle_delay(self, request: web.Request) -> web.Response:
         delay_seconds = float(request.match_info["seconds"])
@@ -1589,6 +1697,61 @@ class AsyncCrawlerTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["title"], "Broken")
         self.assertIn(f"{self.base_url}/oops", list(result["links"]))
 
+    async def test_crawl_respects_max_depth(self) -> None:
+        crawler = AsyncCrawler(max_concurrent=3, max_depth=1)
+
+        result = await crawler.crawl(
+            start_urls=[f"{self.base_url}/crawl/root"],
+            max_pages=10,
+            same_domain_only=True,
+        )
+        await crawler.close()
+
+        processed_urls = dict(result["processed_urls"])
+        self.assertIn(f"{self.base_url}/crawl/root", processed_urls)
+        self.assertIn(f"{self.base_url}/crawl/page-1", processed_urls)
+        self.assertIn(f"{self.base_url}/crawl/page-2", processed_urls)
+        self.assertNotIn(f"{self.base_url}/crawl/page-3", processed_urls)
+        self.assertEqual(processed_urls[f"{self.base_url}/crawl/root"]["depth"], 0)
+        self.assertEqual(processed_urls[f"{self.base_url}/crawl/page-1"]["depth"], 1)
+
+    async def test_crawl_filters_urls_and_skips_duplicates(self) -> None:
+        crawler = AsyncCrawler(max_concurrent=3, max_depth=2)
+
+        result = await crawler.crawl(
+            start_urls=[f"{self.base_url}/crawl/root"],
+            max_pages=10,
+            same_domain_only=True,
+            include_patterns=[r"include|page|root"],
+            exclude_patterns=[r"skip-me"],
+        )
+        await crawler.close()
+
+        processed_urls = dict(result["processed_urls"])
+        visited_urls = list(result["visited_urls"])
+        self.assertIn(f"{self.base_url}/crawl/include-only", processed_urls)
+        self.assertNotIn(f"{self.base_url}/crawl/skip-me", processed_urls)
+        self.assertEqual(visited_urls.count(f"{self.base_url}/crawl/page-1"), 1)
+        self.assertTrue(all("external.example.org" not in url for url in processed_urls))
+
+    async def test_crawl_collects_stats_and_state(self) -> None:
+        crawler = AsyncCrawler(max_concurrent=2, max_depth=2, per_domain_concurrent=1)
+
+        with self.assertLogs("src.models", level="INFO") as captured_logs:
+            result = await crawler.crawl(
+                start_urls=[f"{self.base_url}/crawl/root", f"{self.base_url}/status/404"],
+                max_pages=6,
+                same_domain_only=True,
+            )
+        await crawler.close()
+
+        stats = dict(result["stats"])
+        self.assertGreaterEqual(int(stats["processed_pages"]), 1)
+        self.assertGreaterEqual(int(stats["failed_pages"]), 1)
+        self.assertIn(f"{self.base_url}/status/404", dict(result["failed_urls"]))
+        self.assertIn("Crawl progress", "\n".join(captured_logs.output))
+        self.assertEqual(dict(stats["semaphores"])["per_domain_concurrent"], 1)
+
     async def test_run_async_crawler_demo_returns_expected_shape(self) -> None:
         original_fetch_urls = AsyncCrawler.fetch_urls
         original_fetch_url = AsyncCrawler.fetch_url
@@ -1642,6 +1805,42 @@ class AsyncCrawlerTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(list(result["summary"])), 3)
         self.assertEqual(dict(enumerate(list(result["summary"])))[0]["links_count"], 1)
         self.assertEqual(dict(enumerate(list(result["summary"])))[0]["images_count"], 1)
+
+    async def test_run_site_crawl_demo_writes_json_output(self) -> None:
+        original_crawl = AsyncCrawler.crawl
+
+        async def fake_crawl(self, start_urls: list[str], max_pages: int = 100, same_domain_only: bool = False, include_patterns=None, exclude_patterns=None, max_depth=None) -> dict[str, object]:
+            return {
+                "processed_urls": {
+                    start_urls[0]: {
+                        "url": start_urls[0],
+                        "title": "Demo page",
+                        "text": "demo",
+                        "links": [f"{start_urls[0]}/next"],
+                        "metadata": {},
+                        "images": [],
+                        "headings": [],
+                        "tables": [],
+                        "lists": [],
+                        "depth": 0,
+                    }
+                },
+                "failed_urls": {},
+                "visited_urls": start_urls,
+                "stats": {"pending": 0, "processed_pages": 1, "failed_pages": 0, "pages_per_second": 5.0},
+            }
+
+        AsyncCrawler.crawl = fake_crawl
+        try:
+            result = await run_site_crawl_demo()
+        finally:
+            AsyncCrawler.crawl = original_crawl
+
+        output_path = Path(str(result["output_path"]))
+        self.assertTrue(output_path.exists())
+        payload = json.loads(output_path.read_text(encoding="utf-8"))
+        self.assertEqual(list(payload["processed_urls"].keys()), ["https://example.com"])
+        self.assertEqual(dict(result["stats"])["processed_pages"], 1)
 
 
 if __name__ == "__main__":

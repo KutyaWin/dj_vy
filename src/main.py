@@ -697,6 +697,61 @@ def print_html_parser_demo_summary(result: dict[str, object]) -> None:
         )
 
 
+async def run_site_crawl_demo() -> dict[str, object]:
+    start_urls = ["https://example.com"]
+    crawler = AsyncCrawler(max_concurrent=5, per_domain_concurrent=2, max_depth=1, html_parser=HTMLParser())
+    crawl_result: dict[str, object] = {}
+    elapsed = 0.0
+    output_dir = Path(tempfile.gettempdir()) / "dj_vy_site_crawl_demo"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = output_dir / "crawl_results.json"
+    try:
+        started_at = perf_counter()
+        crawl_result = await crawler.crawl(
+            start_urls=start_urls,
+            max_pages=10,
+            same_domain_only=True,
+        )
+        elapsed = perf_counter() - started_at
+    finally:
+        await crawler.close()
+
+    payload = {
+        "start_urls": start_urls,
+        "processed_urls": crawl_result.get("processed_urls", {}),
+        "failed_urls": crawl_result.get("failed_urls", {}),
+        "visited_urls": crawl_result.get("visited_urls", []),
+        "stats": crawl_result.get("stats", {}),
+    }
+    output_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return {
+        "start_urls": start_urls,
+        "processed_urls": crawl_result.get("processed_urls", {}),
+        "failed_urls": crawl_result.get("failed_urls", {}),
+        "visited_urls": crawl_result.get("visited_urls", []),
+        "stats": crawl_result.get("stats", {}),
+        "elapsed": elapsed,
+        "output_path": str(output_path),
+    }
+
+
+def print_site_crawl_demo_summary(result: dict[str, object]) -> None:
+    print_section("SITE CRAWL DEMONSTRATION")
+    print(f"Start URLs: {', '.join(list(result['start_urls']))}")
+    print(f"Output JSON: {result['output_path']}")
+    print(f"Elapsed: {float(result['elapsed']):.2f}s")
+    stats = dict(result["stats"])
+    print(f"Processed pages: {stats.get('processed_pages', 0)}")
+    print(f"Queued pages: {stats.get('pending', 0)}")
+    print(f"Failed pages: {stats.get('failed_pages', 0)}")
+    print(f"Speed: {float(stats.get('pages_per_second', 0.0)):.2f} pages/sec")
+    for url, page in dict(result["processed_urls"]).items():
+        print(
+            f"- url={url} | depth={page.get('depth', 0)} | title={page.get('title', '')} | "
+            f"links={len(list(page.get('links', [])))}"
+        )
+
+
 def main() -> None:
     print_section("BANKING SYSTEM DEMONSTRATION")
     bank, processor, queue, clients, accounts, phase_times, audit_log_path = build_demo_bank()

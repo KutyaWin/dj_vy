@@ -2,14 +2,18 @@ from __future__ import annotations
 
 import asyncio
 from abc import ABC, abstractmethod
+from contextlib import asynccontextmanager
 import csv
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from enum import Enum
+import heapq
 import json
 import logging
 from pathlib import Path
+import re
+from time import perf_counter
 from urllib.parse import urldefrag, urljoin, urlparse
 from uuid import uuid4
 
@@ -2354,6 +2358,140 @@ class HTMLParser:
         return result
 
 
+class CrawlerQueue:
+    def __init__(self) -> None:
+        self._heap: list[tuple[int, int, str, int]] = []
+        self._counter = 0
+        self._lock = asyncio.Lock()
+        self._queued_urls: set[str] = set()
+        self._in_progress_urls: set[str] = set()
+        self._processed_urls: set[str] = set()
+        self._failed_urls: dict[str, str] = {}
+        self._depths: dict[str, int] = {}
+
+    async def add_url(self, url: str, priority: int = 0, depth: int = 0) -> bool:
+        if not isinstance(url, str) or not url.strip():
+            raise InvalidOperationError("url must be a non-empty string")
+        if not isinstance(priority, int):
+            raise InvalidOperationError("priority must be an integer")
+        if not isinstance(depth, int) or depth < 0:
+            raise InvalidOperationError("depth must be a non-negative integer")
+        normalized_url = url.strip()
+        async with self._lock:
+            if normalized_url in self._queued_urls:
+                return False
+            if normalized_url in self._in_progress_urls:
+                return False
+            if normalized_url in self._processed_urls:
+                return False
+            if normalized_url in self._failed_urls:
+                return False
+            heapq.heappush(self._heap, (priority, self._counter, normalized_url, depth))
+            self._counter += 1
+            self._queued_urls.add(normalized_url)
+            self._depths[normalized_url] = depth
+            return True
+
+    async def get_next(self) -> str | None:
+        async with self._lock:
+            if not self._heap:
+                return None
+            _priority, _counter, url, _depth = heapq.heappop(self._heap)
+            self._queued_urls.discard(url)
+            self._in_progress_urls.add(url)
+            return url
+
+    def get_depth(self, url: str) -> int:
+        return self._depths.get(url, 0)
+
+    def is_known(self, url: str) -> bool:
+        return url in self._queued_urls or url in self._in_progress_urls or url in self._processed_urls or url in self._failed_urls
+
+    def pending_count(self) -> int:
+        return len(self._queued_urls)
+
+    def mark_processed(self, url: str) -> None:
+        normalized_url = url.strip()
+        self._in_progress_urls.discard(normalized_url)
+        self._queued_urls.discard(normalized_url)
+        self._failed_urls.pop(normalized_url, None)
+        self._processed_urls.add(normalized_url)
+
+    def mark_failed(self, url: str, error: str) -> None:
+        normalized_url = url.strip()
+        self._in_progress_urls.discard(normalized_url)
+        self._queued_urls.discard(normalized_url)
+        self._failed_urls[normalized_url] = error.strip() if isinstance(error, str) and error.strip() else "unknown error"
+
+    def get_stats(self) -> dict[str, object]:
+        return {
+            "pending": len(self._queued_urls),
+            "in_progress": len(self._in_progress_urls),
+            "processed": len(self._processed_urls),
+            "failed": len(self._failed_urls),
+            "known": len(self._queued_urls | self._in_progress_urls | self._processed_urls | set(self._failed_urls.keys())),
+        }
+
+
+class SemaphoreManager:
+    def __init__(self, max_concurrent: int, per_domain_concurrent: int | None = None) -> None:
+        if not isinstance(max_concurrent, int) or max_concurrent < 1:
+            raise InvalidOperationError("max_concurrent must be a positive integer")
+        if per_domain_concurrent is None:
+            per_domain_concurrent = max_concurrent
+        if not isinstance(per_domain_concurrent, int) or per_domain_concurrent < 1:
+            raise InvalidOperationError("per_domain_concurrent must be a positive integer")
+        self.max_concurrent = max_concurrent
+        self.per_domain_concurrent = per_domain_concurrent
+        self._global_semaphore = asyncio.Semaphore(max_concurrent)
+        self._domain_semaphores: dict[str, asyncio.Semaphore] = {}
+        self._lock = asyncio.Lock()
+        self._active_tasks = 0
+        self._active_by_domain: dict[str, int] = {}
+
+    @staticmethod
+    def _get_domain(url: str) -> str:
+        return urlparse(url).netloc
+
+    async def _get_domain_semaphore(self, domain: str) -> asyncio.Semaphore:
+        async with self._lock:
+            semaphore = self._domain_semaphores.get(domain)
+            if semaphore is None:
+                semaphore = asyncio.Semaphore(self.per_domain_concurrent)
+                self._domain_semaphores[domain] = semaphore
+            return semaphore
+
+    @asynccontextmanager
+    async def limit(self, url: str):
+        domain = self._get_domain(url)
+        domain_semaphore = await self._get_domain_semaphore(domain)
+        await self._global_semaphore.acquire()
+        await domain_semaphore.acquire()
+        async with self._lock:
+            self._active_tasks += 1
+            self._active_by_domain[domain] = self._active_by_domain.get(domain, 0) + 1
+        try:
+            yield
+        finally:
+            async with self._lock:
+                self._active_tasks = max(0, self._active_tasks - 1)
+                current_active = self._active_by_domain.get(domain, 0) - 1
+                if current_active <= 0:
+                    self._active_by_domain.pop(domain, None)
+                else:
+                    self._active_by_domain[domain] = current_active
+            domain_semaphore.release()
+            self._global_semaphore.release()
+
+    def get_stats(self) -> dict[str, object]:
+        return {
+            "max_concurrent": self.max_concurrent,
+            "per_domain_concurrent": self.per_domain_concurrent,
+            "active_tasks": self._active_tasks,
+            "active_by_domain": dict(self._active_by_domain),
+        }
+
+
 class AsyncCrawler:
     def __init__(
         self,
@@ -2362,24 +2500,39 @@ class AsyncCrawler:
         read_timeout: float = 10,
         total_timeout: float = 15,
         html_parser: HTMLParser | None = None,
+        max_depth: int = 2,
+        per_domain_concurrent: int | None = None,
     ) -> None:
         if not isinstance(max_concurrent, int) or max_concurrent < 1:
             raise InvalidOperationError("max_concurrent must be a positive integer")
+        if not isinstance(max_depth, int) or max_depth < 0:
+            raise InvalidOperationError("max_depth must be a non-negative integer")
+        if per_domain_concurrent is None:
+            per_domain_concurrent = max_concurrent
+        if not isinstance(per_domain_concurrent, int) or per_domain_concurrent < 1:
+            raise InvalidOperationError("per_domain_concurrent must be a positive integer")
         self.max_concurrent = max_concurrent
+        self.max_depth = max_depth
+        self.per_domain_concurrent = per_domain_concurrent
         self._timeout = aiohttp.ClientTimeout(
             total=total_timeout,
             connect=connect_timeout,
             sock_read=read_timeout,
         )
-        self._semaphore = asyncio.Semaphore(max_concurrent)
         self._session: aiohttp.ClientSession | None = None
         self.html_parser = html_parser if html_parser is not None else HTMLParser()
+        self.semaphore_manager = SemaphoreManager(max_concurrent=max_concurrent, per_domain_concurrent=per_domain_concurrent)
+        self.visited_urls: set[str] = set()
+        self.failed_urls: dict[str, str] = {}
+        self.processed_urls: dict[str, dict[str, object]] = {}
+        self.url_depths: dict[str, int] = {}
+        self._crawl_started_at = 0.0
 
     async def _ensure_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
             connector = aiohttp.TCPConnector(
                 limit=self.max_concurrent,
-                limit_per_host=self.max_concurrent,
+                limit_per_host=self.per_domain_concurrent,
                 ttl_dns_cache=300,
             )
             self._session = aiohttp.ClientSession(
@@ -2393,12 +2546,80 @@ class AsyncCrawler:
     def _is_supported_url(url: str) -> bool:
         return isinstance(url, str) and url.startswith(("http://", "https://"))
 
-    async def fetch_url(self, url: str) -> str:
-        if not self._is_supported_url(url):
-            logger.warning("Unsupported URL skipped: %s", url)
+    @staticmethod
+    def _normalize_crawl_url(url: str) -> str:
+        if not isinstance(url, str):
             return ""
+        normalized_url, _fragment = urldefrag(url.strip())
+        return normalized_url
 
-        async with self._semaphore:
+    @staticmethod
+    def _matches_patterns(url: str, patterns: list[str] | None) -> bool:
+        if not patterns:
+            return False
+        return any(re.search(pattern, url) for pattern in patterns)
+
+    def _should_include_url(
+        self,
+        url: str,
+        allowed_domains: set[str],
+        same_domain_only: bool,
+        include_patterns: list[str] | None,
+        exclude_patterns: list[str] | None,
+    ) -> bool:
+        if not self._is_supported_url(url):
+            return False
+        if same_domain_only and urlparse(url).netloc not in allowed_domains:
+            return False
+        if exclude_patterns and self._matches_patterns(url, exclude_patterns):
+            return False
+        if include_patterns and not self._matches_patterns(url, include_patterns):
+            return False
+        return True
+
+    def _reset_crawl_state(self) -> None:
+        self.visited_urls.clear()
+        self.failed_urls.clear()
+        self.processed_urls.clear()
+        self.url_depths.clear()
+        self._crawl_started_at = perf_counter()
+
+    def _get_crawl_stats(self, queue: CrawlerQueue) -> dict[str, object]:
+        elapsed = perf_counter() - self._crawl_started_at if self._crawl_started_at else 0.0
+        processed_count = len(self.processed_urls)
+        failed_count = len(self.failed_urls)
+        total_finished = processed_count + failed_count
+        pages_per_second = total_finished / elapsed if elapsed > 0 else 0.0
+        stats = queue.get_stats()
+        stats.update(
+            {
+                "visited": len(self.visited_urls),
+                "elapsed": elapsed,
+                "pages_per_second": pages_per_second,
+                "processed_pages": processed_count,
+                "failed_pages": failed_count,
+            }
+        )
+        stats["semaphores"] = self.semaphore_manager.get_stats()
+        return stats
+
+    def _log_crawl_progress(self, queue: CrawlerQueue) -> None:
+        stats = self._get_crawl_stats(queue)
+        logger.info(
+            "Crawl progress: processed=%s queued=%s errors=%s speed=%.2f pages/sec",
+            stats["processed_pages"],
+            stats["pending"],
+            stats["failed_pages"],
+            float(stats["pages_per_second"]),
+        )
+
+    async def _fetch_url_with_error(self, url: str) -> tuple[str, str | None]:
+        if not self._is_supported_url(url):
+            error = "unsupported url"
+            logger.warning("Unsupported URL skipped: %s", url)
+            return "", error
+
+        async with self.semaphore_manager.limit(url):
             logger.info("Starting download: %s", url)
             try:
                 session = await self._ensure_session()
@@ -2406,14 +2627,20 @@ class AsyncCrawler:
                     response.raise_for_status()
                     content = await response.text()
                     logger.info("Completed download: %s", url)
-                    return content
+                    return content, None
             except aiohttp.ClientResponseError as error:
                 logger.warning("HTTP error for %s: %s", url, error)
+                return "", str(error)
             except asyncio.TimeoutError as error:
                 logger.warning("Timeout error for %s: %s", url, error)
+                return "", str(error)
             except aiohttp.ClientError as error:
                 logger.warning("Network error for %s: %s", url, error)
-            return ""
+                return "", str(error)
+
+    async def fetch_url(self, url: str) -> str:
+        content, _error = await self._fetch_url_with_error(url)
+        return content
 
     async def fetch_urls(self, urls: list[str]) -> dict[str, str]:
         tasks = [self.fetch_url(url) for url in urls]
@@ -2425,6 +2652,164 @@ class AsyncCrawler:
         if not html:
             return self.html_parser.empty_result(url)
         return await self.html_parser.parse_html(html, url)
+
+    async def _enqueue_url(
+        self,
+        queue: CrawlerQueue,
+        url: str,
+        depth: int,
+        allowed_domains: set[str],
+        same_domain_only: bool,
+        include_patterns: list[str] | None,
+        exclude_patterns: list[str] | None,
+    ) -> bool:
+        normalized_url = self._normalize_crawl_url(url)
+        if not normalized_url:
+            return False
+        if depth > self.max_depth:
+            return False
+        if normalized_url in self.visited_urls:
+            return False
+        if normalized_url in self.processed_urls:
+            return False
+        if normalized_url in self.failed_urls:
+            return False
+        if queue.is_known(normalized_url):
+            return False
+        if not self._should_include_url(
+            normalized_url,
+            allowed_domains=allowed_domains,
+            same_domain_only=same_domain_only,
+            include_patterns=include_patterns,
+            exclude_patterns=exclude_patterns,
+        ):
+            return False
+        self.url_depths[normalized_url] = depth
+        return await queue.add_url(normalized_url, priority=depth, depth=depth)
+
+    async def _process_crawl_url(
+        self,
+        queue: CrawlerQueue,
+        url: str,
+        depth: int,
+        max_pages: int,
+        allowed_domains: set[str],
+        same_domain_only: bool,
+        include_patterns: list[str] | None,
+        exclude_patterns: list[str] | None,
+    ) -> None:
+        content, error = await self._fetch_url_with_error(url)
+        if error or not content:
+            failure_reason = error or "empty response"
+            queue.mark_failed(url, failure_reason)
+            self.failed_urls[url] = failure_reason
+            self._log_crawl_progress(queue)
+            return
+
+        parsed_result = await self.html_parser.parse_html(content, url)
+        parsed_result["depth"] = depth
+        self.processed_urls[url] = parsed_result
+        queue.mark_processed(url)
+
+        if depth < self.max_depth:
+            for link in list(parsed_result.get("links", [])):
+                if len(self.processed_urls) + len(self.failed_urls) + queue.pending_count() >= max_pages:
+                    break
+                await self._enqueue_url(
+                    queue,
+                    link,
+                    depth=depth + 1,
+                    allowed_domains=allowed_domains,
+                    same_domain_only=same_domain_only,
+                    include_patterns=include_patterns,
+                    exclude_patterns=exclude_patterns,
+                )
+        self._log_crawl_progress(queue)
+
+    async def crawl(
+        self,
+        start_urls: list[str],
+        max_pages: int = 100,
+        same_domain_only: bool = False,
+        include_patterns: list[str] | None = None,
+        exclude_patterns: list[str] | None = None,
+        max_depth: int | None = None,
+    ) -> dict[str, object]:
+        if not isinstance(start_urls, list) or not start_urls:
+            raise InvalidOperationError("start_urls must be a non-empty list")
+        if not isinstance(max_pages, int) or max_pages < 1:
+            raise InvalidOperationError("max_pages must be a positive integer")
+        if max_depth is not None:
+            if not isinstance(max_depth, int) or max_depth < 0:
+                raise InvalidOperationError("max_depth must be a non-negative integer")
+            self.max_depth = max_depth
+
+        self._reset_crawl_state()
+        queue = CrawlerQueue()
+        normalized_start_urls = [self._normalize_crawl_url(url) for url in start_urls]
+        allowed_domains = {urlparse(url).netloc for url in normalized_start_urls if self._is_supported_url(url)}
+
+        for start_url in normalized_start_urls:
+            await self._enqueue_url(
+                queue,
+                start_url,
+                depth=0,
+                allowed_domains=allowed_domains,
+                same_domain_only=False,
+                include_patterns=None,
+                exclude_patterns=None,
+            )
+
+        tasks: set[asyncio.Task[None]] = set()
+        try:
+            while len(self.processed_urls) + len(self.failed_urls) < max_pages and (queue.pending_count() > 0 or tasks):
+                while queue.pending_count() > 0 and len(tasks) < self.max_concurrent and len(self.visited_urls) < max_pages:
+                    next_url = await queue.get_next()
+                    if next_url is None:
+                        break
+                    depth = queue.get_depth(next_url)
+                    if next_url in self.visited_urls:
+                        queue.mark_processed(next_url)
+                        continue
+                    if depth > self.max_depth:
+                        queue.mark_processed(next_url)
+                        continue
+                    self.visited_urls.add(next_url)
+                    self.url_depths[next_url] = depth
+                    tasks.add(
+                        asyncio.create_task(
+                            self._process_crawl_url(
+                                queue,
+                                next_url,
+                                depth=depth,
+                                max_pages=max_pages,
+                                allowed_domains=allowed_domains,
+                                same_domain_only=same_domain_only,
+                                include_patterns=include_patterns,
+                                exclude_patterns=exclude_patterns,
+                            )
+                        )
+                    )
+
+                if not tasks:
+                    break
+
+                done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+                tasks = set(pending)
+                for completed_task in done:
+                    await completed_task
+        finally:
+            for task in tasks:
+                task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+
+        return {
+            "processed_urls": dict(self.processed_urls),
+            "failed_urls": dict(self.failed_urls),
+            "visited_urls": sorted(self.visited_urls),
+            "stats": self._get_crawl_stats(queue),
+        }
 
     async def close(self) -> None:
         if self._session is not None and not self._session.closed:
