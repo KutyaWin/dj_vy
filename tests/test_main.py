@@ -30,8 +30,10 @@ from src.models import (
     InvalidOperationError,
     Owner,
     PremiumAccount,
+    RateLimiter,
     ReportBuilder,
     RiskLevel,
+    RobotsParser,
     SavingsAccount,
     SemaphoreManager,
     Transaction,
@@ -40,7 +42,7 @@ from src.models import (
     TransactionStatus,
     TransactionType,
 )
-from src.main import build_demo_bank, fetch_urls_sequentially, generate_report_artifacts, run_async_crawler_demo, run_html_parser_demo, run_site_crawl_demo
+from src.main import build_demo_bank, fetch_urls_sequentially, generate_report_artifacts, run_async_crawler_demo, run_html_parser_demo, run_polite_crawl_demo, run_site_crawl_demo
 
 
 class BankAccountTestCase(unittest.TestCase):
@@ -1453,9 +1455,90 @@ class SemaphoreManagerTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(manager.get_stats()["active_tasks"], 0)
 
 
+class RateLimiterTestCase(unittest.IsolatedAsyncioTestCase):
+    async def test_rate_limiter_enforces_delay_for_same_domain(self) -> None:
+        limiter = RateLimiter(requests_per_second=5.0, per_domain=True)
+
+        started_at = time.perf_counter()
+        await limiter.acquire("example.com")
+        await limiter.acquire("example.com")
+        elapsed = time.perf_counter() - started_at
+
+        self.assertGreaterEqual(elapsed, 0.17)
+        self.assertGreaterEqual(float(limiter.get_stats()["average_wait"]), 0.08)
+
+    async def test_rate_limiter_keeps_domains_independent_when_per_domain_enabled(self) -> None:
+        limiter = RateLimiter(requests_per_second=5.0, per_domain=True)
+
+        await limiter.acquire("example.com")
+        started_at = time.perf_counter()
+        await limiter.acquire("other.example.org")
+        elapsed = time.perf_counter() - started_at
+
+        self.assertLess(elapsed, 0.08)
+
+    async def test_rate_limiter_uses_global_limit_when_disabled_per_domain(self) -> None:
+        limiter = RateLimiter(requests_per_second=5.0, per_domain=False)
+
+        await limiter.acquire("example.com")
+        started_at = time.perf_counter()
+        await limiter.acquire("other.example.org")
+        elapsed = time.perf_counter() - started_at
+
+        self.assertGreaterEqual(elapsed, 0.17)
+
+
+class RobotsParserTestCase(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self) -> None:
+        self.robots_txt = "User-agent: *\nDisallow:\n"
+        app = web.Application()
+        app.router.add_get("/robots.txt", self.handle_robots)
+        self.runner = web.AppRunner(app)
+        await self.runner.setup()
+        self.site = web.TCPSite(self.runner, "127.0.0.1", 0)
+        await self.site.start()
+        sockets = self.site._server.sockets
+        self.port = sockets[0].getsockname()[1]
+        self.base_url = f"http://127.0.0.1:{self.port}"
+
+    async def asyncTearDown(self) -> None:
+        await self.runner.cleanup()
+
+    async def handle_robots(self, request: web.Request) -> web.Response:
+        return web.Response(text=self.robots_txt, content_type="text/plain")
+
+    async def test_fetch_robots_parses_rules_and_caches_result(self) -> None:
+        parser = RobotsParser(timeout=1.0, user_agent="MyBot/1.0")
+        self.robots_txt = (
+            "User-agent: MyBot\n"
+            "Disallow: /private\n"
+            "Allow: /private/public\n"
+            "Crawl-delay: 0.25\n\n"
+            "User-agent: *\n"
+            "Disallow: /tmp\n"
+        )
+
+        rules = await parser.fetch_robots(self.base_url)
+        can_fetch_private = parser.can_fetch(f"{self.base_url}/private/public", user_agent="MyBot/1.0")
+        can_fetch_tmp = parser.can_fetch(f"{self.base_url}/tmp/file", user_agent="OtherBot/1.0")
+        crawl_delay = parser.get_crawl_delay("MyBot/1.0")
+        cached_rules = await parser.fetch_robots(self.base_url)
+
+        self.assertTrue(dict(rules["rules"]).get("mybot") is not None)
+        self.assertTrue(can_fetch_private)
+        self.assertFalse(can_fetch_tmp)
+        self.assertAlmostEqual(crawl_delay, 0.25, places=2)
+        self.assertIs(rules, cached_rules)
+
+
 class AsyncCrawlerTestCase(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
+        self.robots_txt = "User-agent: *\nDisallow:\n"
+        self.received_user_agents: list[str] = []
+        self.request_times: dict[str, list[float]] = {}
+        self.flaky_status_hits = 0
         app = web.Application()
+        app.router.add_get("/robots.txt", self.handle_robots)
         app.router.add_get("/ok", self.handle_ok)
         app.router.add_get("/json", self.handle_json)
         app.router.add_get("/html", self.handle_html)
@@ -1464,8 +1547,11 @@ class AsyncCrawlerTestCase(unittest.IsolatedAsyncioTestCase):
         app.router.add_get("/crawl/page-1", self.handle_crawl_page_1)
         app.router.add_get("/crawl/page-2", self.handle_crawl_page_2)
         app.router.add_get("/crawl/page-3", self.handle_crawl_page_3)
+        app.router.add_get("/crawl/blocked", self.handle_crawl_blocked)
         app.router.add_get("/crawl/skip-me", self.handle_crawl_skip_me)
         app.router.add_get("/crawl/include-only", self.handle_crawl_include_only)
+        app.router.add_get("/ua", self.handle_ua)
+        app.router.add_get("/flaky", self.handle_flaky)
         app.router.add_get("/delay/{seconds}", self.handle_delay)
         app.router.add_get("/status/{code}", self.handle_status)
 
@@ -1480,10 +1566,19 @@ class AsyncCrawlerTestCase(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self) -> None:
         await self.runner.cleanup()
 
+    def _record_request(self, request: web.Request, path: str) -> None:
+        self.received_user_agents.append(request.headers.get("User-Agent", ""))
+        self.request_times.setdefault(path, []).append(time.perf_counter())
+
+    async def handle_robots(self, request: web.Request) -> web.Response:
+        return web.Response(text=self.robots_txt, content_type="text/plain")
+
     async def handle_ok(self, request: web.Request) -> web.Response:
+        self._record_request(request, "/ok")
         return web.Response(text="example page")
 
     async def handle_json(self, request: web.Request) -> web.Response:
+        self._record_request(request, "/json")
         return web.json_response(
             {
                 "args": {},
@@ -1504,6 +1599,7 @@ class AsyncCrawlerTestCase(unittest.IsolatedAsyncioTestCase):
         )
 
     async def handle_html(self, request: web.Request) -> web.Response:
+        self._record_request(request, "/html")
         return web.Response(
             text=(
                 "<html><head><title>Parser Page</title>"
@@ -1517,9 +1613,11 @@ class AsyncCrawlerTestCase(unittest.IsolatedAsyncioTestCase):
         )
 
     async def handle_broken_html(self, request: web.Request) -> web.Response:
+        self._record_request(request, "/broken-html")
         return web.Response(text="<html><head><title>Broken<title><body><a href='/oops'>Oops", content_type="text/html")
 
     async def handle_crawl_root(self, request: web.Request) -> web.Response:
+        self._record_request(request, "/crawl/root")
         return web.Response(
             text=(
                 f"<html><head><title>Root</title></head><body>"
@@ -1527,6 +1625,7 @@ class AsyncCrawlerTestCase(unittest.IsolatedAsyncioTestCase):
                 f"<a href='/crawl/page-2'>Page 2</a>"
                 f"<a href='/crawl/page-1'>Page 1 Duplicate</a>"
                 f"<a href='/crawl/include-only'>Include Only</a>"
+                f"<a href='/crawl/blocked'>Blocked</a>"
                 f"<a href='/crawl/skip-me'>Skip Me</a>"
                 f"<a href='https://external.example.org/outside'>External</a>"
                 f"</body></html>"
@@ -1535,6 +1634,7 @@ class AsyncCrawlerTestCase(unittest.IsolatedAsyncioTestCase):
         )
 
     async def handle_crawl_page_1(self, request: web.Request) -> web.Response:
+        self._record_request(request, "/crawl/page-1")
         return web.Response(
             text=(
                 "<html><head><title>Page 1</title></head><body>"
@@ -1546,6 +1646,7 @@ class AsyncCrawlerTestCase(unittest.IsolatedAsyncioTestCase):
         )
 
     async def handle_crawl_page_2(self, request: web.Request) -> web.Response:
+        self._record_request(request, "/crawl/page-2")
         return web.Response(
             text=(
                 "<html><head><title>Page 2</title></head><body>"
@@ -1556,23 +1657,43 @@ class AsyncCrawlerTestCase(unittest.IsolatedAsyncioTestCase):
         )
 
     async def handle_crawl_page_3(self, request: web.Request) -> web.Response:
+        self._record_request(request, "/crawl/page-3")
         return web.Response(
             text="<html><head><title>Page 3</title></head><body><p>Leaf page</p></body></html>",
             content_type="text/html",
         )
 
+    async def handle_crawl_blocked(self, request: web.Request) -> web.Response:
+        self._record_request(request, "/crawl/blocked")
+        return web.Response(text="<html><head><title>Blocked</title></head><body></body></html>", content_type="text/html")
+
     async def handle_crawl_skip_me(self, request: web.Request) -> web.Response:
+        self._record_request(request, "/crawl/skip-me")
         return web.Response(text="<html><head><title>Skip</title></head><body></body></html>", content_type="text/html")
 
     async def handle_crawl_include_only(self, request: web.Request) -> web.Response:
+        self._record_request(request, "/crawl/include-only")
         return web.Response(text="<html><head><title>Include</title></head><body></body></html>", content_type="text/html")
 
+    async def handle_ua(self, request: web.Request) -> web.Response:
+        self._record_request(request, "/ua")
+        return web.Response(text=request.headers.get("User-Agent", ""))
+
+    async def handle_flaky(self, request: web.Request) -> web.Response:
+        self._record_request(request, "/flaky")
+        self.flaky_status_hits += 1
+        if self.flaky_status_hits == 1:
+            return web.Response(status=500, text="temporary failure")
+        return web.Response(text="recovered")
+
     async def handle_delay(self, request: web.Request) -> web.Response:
+        self._record_request(request, "/delay")
         delay_seconds = float(request.match_info["seconds"])
         await asyncio.sleep(delay_seconds)
         return web.Response(text=f"delayed {delay_seconds}")
 
     async def handle_status(self, request: web.Request) -> web.Response:
+        self._record_request(request, "/status")
         status_code = int(request.match_info["code"])
         return web.Response(status=status_code, text=f"status {status_code}")
 
@@ -1621,8 +1742,8 @@ class AsyncCrawlerTestCase(unittest.IsolatedAsyncioTestCase):
 
     async def test_parallel_fetch_is_faster_than_sequential(self) -> None:
         urls = [f"{self.base_url}/delay/0.2?run={index}" for index in range(5)]
-        parallel_crawler = AsyncCrawler(max_concurrent=5)
-        sequential_crawler = AsyncCrawler(max_concurrent=1)
+        parallel_crawler = AsyncCrawler(max_concurrent=5, requests_per_second=100.0, respect_robots=False, min_delay=0.0, jitter=0.0)
+        sequential_crawler = AsyncCrawler(max_concurrent=1, requests_per_second=100.0, respect_robots=False, min_delay=0.0, jitter=0.0)
 
         parallel_started_at = time.perf_counter()
         parallel_results = await parallel_crawler.fetch_urls(urls)
@@ -1697,6 +1818,87 @@ class AsyncCrawlerTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["title"], "Broken")
         self.assertIn(f"{self.base_url}/oops", list(result["links"]))
 
+    async def test_fetch_url_respects_min_delay(self) -> None:
+        crawler = AsyncCrawler(
+            max_concurrent=1,
+            requests_per_second=100.0,
+            respect_robots=False,
+            min_delay=0.12,
+            jitter=0.0,
+        )
+
+        started_at = time.perf_counter()
+        await crawler.fetch_url(f"{self.base_url}/ok")
+        await crawler.fetch_url(f"{self.base_url}/ok")
+        elapsed = time.perf_counter() - started_at
+        stats = crawler.rate_limiter.get_stats()
+        await crawler.close()
+
+        self.assertGreaterEqual(elapsed, 0.22)
+        self.assertEqual(stats["acquire_count"], 2)
+
+    async def test_fetch_url_respects_robots_crawl_delay(self) -> None:
+        self.robots_txt = "User-agent: *\nCrawl-delay: 0.12\nDisallow:\n"
+        crawler = AsyncCrawler(
+            max_concurrent=1,
+            requests_per_second=100.0,
+            respect_robots=True,
+            min_delay=0.0,
+            jitter=0.0,
+            user_agent="MyBot/1.0",
+        )
+
+        started_at = time.perf_counter()
+        await crawler.fetch_url(f"{self.base_url}/ok")
+        await crawler.fetch_url(f"{self.base_url}/ok")
+        elapsed = time.perf_counter() - started_at
+        await crawler.close()
+
+        self.assertGreaterEqual(elapsed, 0.22)
+
+    async def test_fetch_url_rotates_user_agents(self) -> None:
+        crawler = AsyncCrawler(
+            max_concurrent=1,
+            requests_per_second=100.0,
+            respect_robots=False,
+            user_agent="MyBot/1.0",
+            user_agents=["BotA/1.0", "BotB/1.0"],
+        )
+
+        first = await crawler.fetch_url(f"{self.base_url}/ua")
+        second = await crawler.fetch_url(f"{self.base_url}/ua")
+        await crawler.close()
+
+        self.assertEqual(first, "BotA/1.0")
+        self.assertEqual(second, "BotB/1.0")
+        self.assertGreaterEqual(len(self.received_user_agents), 2)
+        self.assertIn("BotA/1.0", self.received_user_agents)
+        self.assertIn("BotB/1.0", self.received_user_agents)
+
+    async def test_fetch_url_applies_backoff_after_server_error(self) -> None:
+        crawler = AsyncCrawler(
+            max_concurrent=1,
+            requests_per_second=100.0,
+            respect_robots=False,
+            min_delay=0.0,
+            jitter=0.0,
+            backoff_base=0.12,
+            backoff_factor=2.0,
+            backoff_max=0.5,
+        )
+
+        first = await crawler.fetch_url(f"{self.base_url}/flaky")
+        started_at = time.perf_counter()
+        second = await crawler.fetch_url(f"{self.base_url}/flaky")
+        elapsed = time.perf_counter() - started_at
+        stats = crawler._get_crawl_stats(CrawlerQueue())
+        await crawler.close()
+
+        self.assertEqual(first, "")
+        self.assertEqual(second, "recovered")
+        self.assertGreaterEqual(elapsed, 0.10)
+        self.assertGreaterEqual(int(stats["backoff_count"]), 1)
+
     async def test_crawl_respects_max_depth(self) -> None:
         crawler = AsyncCrawler(max_concurrent=3, max_depth=1)
 
@@ -1751,6 +1953,28 @@ class AsyncCrawlerTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertIn(f"{self.base_url}/status/404", dict(result["failed_urls"]))
         self.assertIn("Crawl progress", "\n".join(captured_logs.output))
         self.assertEqual(dict(stats["semaphores"])["per_domain_concurrent"], 1)
+
+    async def test_crawl_blocks_urls_disallowed_by_robots(self) -> None:
+        self.robots_txt = "User-agent: *\nDisallow: /crawl/blocked\n"
+        crawler = AsyncCrawler(
+            max_concurrent=2,
+            max_depth=1,
+            requests_per_second=100.0,
+            respect_robots=True,
+            user_agent="MyBot/1.0",
+        )
+
+        result = await crawler.crawl(
+            start_urls=[f"{self.base_url}/crawl/root"],
+            max_pages=10,
+            same_domain_only=True,
+        )
+        await crawler.close()
+
+        self.assertIn(f"{self.base_url}/crawl/blocked", dict(result["blocked_urls"]))
+        self.assertNotIn(f"{self.base_url}/crawl/blocked", dict(result["processed_urls"]))
+        self.assertEqual(len(self.request_times.get("/crawl/blocked", [])), 0)
+        self.assertGreaterEqual(int(dict(result["stats"])["robots_blocked"]), 1)
 
     async def test_run_async_crawler_demo_returns_expected_shape(self) -> None:
         original_fetch_urls = AsyncCrawler.fetch_urls
@@ -1841,6 +2065,30 @@ class AsyncCrawlerTestCase(unittest.IsolatedAsyncioTestCase):
         payload = json.loads(output_path.read_text(encoding="utf-8"))
         self.assertEqual(list(payload["processed_urls"].keys()), ["https://example.com"])
         self.assertEqual(dict(result["stats"])["processed_pages"], 1)
+
+    async def test_run_polite_crawl_demo_writes_json_output(self) -> None:
+        original_crawl = AsyncCrawler.crawl
+
+        async def fake_crawl(self, start_urls: list[str], max_pages: int = 100, same_domain_only: bool = False, include_patterns=None, exclude_patterns=None, max_depth=None) -> dict[str, object]:
+            return {
+                "processed_urls": {},
+                "failed_urls": {},
+                "blocked_urls": {f"{start_urls[0]}/admin": "blocked by robots.txt"},
+                "visited_urls": start_urls,
+                "stats": {"processed_pages": 0, "failed_pages": 0, "robots_blocked": 1, "current_req_per_sec": 1.5, "average_delay": 0.5, "backoff_count": 0},
+            }
+
+        AsyncCrawler.crawl = fake_crawl
+        try:
+            result = await run_polite_crawl_demo()
+        finally:
+            AsyncCrawler.crawl = original_crawl
+
+        output_path = Path(str(result["output_path"]))
+        self.assertTrue(output_path.exists())
+        payload = json.loads(output_path.read_text(encoding="utf-8"))
+        self.assertEqual(dict(payload["blocked_urls"])["https://example.com/admin"], "blocked by robots.txt")
+        self.assertEqual(dict(result["stats"])["robots_blocked"], 1)
 
 
 if __name__ == "__main__":
