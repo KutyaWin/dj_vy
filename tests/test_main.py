@@ -1,5 +1,6 @@
 
 import asyncio
+import aiohttp
 from bs4 import BeautifulSoup
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -28,21 +29,26 @@ from src.models import (
     HTMLParser,
     InsufficientFundsError,
     InvalidOperationError,
+    NetworkError,
     Owner,
+    ParseError,
+    PermanentError,
     PremiumAccount,
     RateLimiter,
     ReportBuilder,
     RiskLevel,
+    RetryStrategy,
     RobotsParser,
     SavingsAccount,
     SemaphoreManager,
+    TransientError,
     Transaction,
     TransactionProcessor,
     TransactionQueue,
     TransactionStatus,
     TransactionType,
 )
-from src.main import build_demo_bank, fetch_urls_sequentially, generate_report_artifacts, run_async_crawler_demo, run_html_parser_demo, run_polite_crawl_demo, run_site_crawl_demo
+from src.main import build_demo_bank, fetch_urls_sequentially, generate_report_artifacts, run_async_crawler_demo, run_html_parser_demo, run_polite_crawl_demo, run_retry_demo, run_site_crawl_demo
 
 
 class BankAccountTestCase(unittest.TestCase):
@@ -1531,6 +1537,69 @@ class RobotsParserTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertIs(rules, cached_rules)
 
 
+class RetryStrategyTestCase(unittest.IsolatedAsyncioTestCase):
+    async def test_execute_with_retry_retries_transient_error_and_succeeds(self) -> None:
+        strategy = RetryStrategy(max_retries=3, backoff_factor=2.0, base_delay=0.01)
+        attempts = 0
+
+        async def flaky_operation(url: str, _retry_attempt: int = 1) -> str:
+            nonlocal attempts
+            attempts += 1
+            if attempts < 3:
+                raise TransientError("temporary failure", url=url)
+            return "ok"
+
+        result = await strategy.execute_with_retry(flaky_operation, "https://example.com")
+
+        self.assertEqual(result, "ok")
+        self.assertEqual(attempts, 3)
+        self.assertEqual(strategy.get_stats()["successful_retries"], 1)
+
+    async def test_execute_with_retry_does_not_retry_permanent_error(self) -> None:
+        strategy = RetryStrategy(max_retries=3, backoff_factor=2.0, base_delay=0.01)
+        attempts = 0
+
+        async def permanent_failure(url: str) -> str:
+            nonlocal attempts
+            attempts += 1
+            raise PermanentError("not found", url=url)
+
+        with self.assertRaises(PermanentError):
+            await strategy.execute_with_retry(permanent_failure, "https://example.com/404")
+
+        self.assertEqual(attempts, 1)
+        self.assertIn("https://example.com/404", list(strategy.get_stats()["permanent_error_urls"]))
+
+    async def test_execute_with_retry_uses_exponential_backoff(self) -> None:
+        strategy = RetryStrategy(max_retries=2, backoff_factor=2.0, base_delay=0.02)
+        attempts = 0
+
+        async def flaky_operation(url: str) -> str:
+            nonlocal attempts
+            attempts += 1
+            if attempts < 3:
+                raise TransientError("busy", url=url, status_code=503)
+            return "done"
+
+        started_at = time.perf_counter()
+        result = await strategy.execute_with_retry(flaky_operation, "https://example.com/503")
+        elapsed = time.perf_counter() - started_at
+
+        self.assertEqual(result, "done")
+        self.assertGreaterEqual(elapsed, 0.05)
+        self.assertGreaterEqual(float(strategy.get_stats()["average_retry_delay"]), 0.02)
+
+    def test_classify_error_maps_network_and_parse_errors(self) -> None:
+        strategy = RetryStrategy()
+
+        network_error = strategy.classify_error(OSError("connection refused"), url="https://example.com")
+        parse_error = strategy.record_error(ParseError("invalid html", url="https://example.com/page"), url="https://example.com/page")
+
+        self.assertIsInstance(network_error, NetworkError)
+        self.assertIsInstance(parse_error, ParseError)
+        self.assertEqual(dict(strategy.get_stats()["error_counts_by_type"])["ParseError"], 1)
+
+
 class AsyncCrawlerTestCase(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self.robots_txt = "User-agent: *\nDisallow:\n"
@@ -1733,12 +1802,21 @@ class AsyncCrawlerTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(content, "")
 
     async def test_fetch_url_returns_empty_string_on_timeout(self) -> None:
-        crawler = AsyncCrawler(max_concurrent=1, read_timeout=0.05, total_timeout=0.1)
+        crawler = AsyncCrawler(
+            max_concurrent=1,
+            read_timeout=0.05,
+            total_timeout=0.1,
+            retry_strategy=RetryStrategy(max_retries=1, base_delay=0.01),
+        )
 
         content = await crawler.fetch_url(f"{self.base_url}/delay/0.2")
+        retry_stats = crawler.retry_strategy.get_stats()
         await crawler.close()
 
         self.assertEqual(content, "")
+        self.assertGreaterEqual(len(self.request_times.get("/delay", [])), 2)
+        self.assertEqual(dict(crawler.error_details)[f"{self.base_url}/delay/0.2"]["type"], "TransientError")
+        self.assertGreaterEqual(int(retry_stats["retry_attempts_total"]), 1)
 
     async def test_parallel_fetch_is_faster_than_sequential(self) -> None:
         urls = [f"{self.base_url}/delay/0.2?run={index}" for index in range(5)]
@@ -1761,7 +1839,7 @@ class AsyncCrawlerTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertLess(parallel_time, sequential_time)
 
     async def test_logging_reports_start_success_and_error(self) -> None:
-        crawler = AsyncCrawler(max_concurrent=2)
+        crawler = AsyncCrawler(max_concurrent=2, retry_strategy=RetryStrategy(max_retries=1, base_delay=0.01))
 
         with self.assertLogs("src.models", level="INFO") as captured_logs:
             await crawler.fetch_url(f"{self.base_url}/ok")
@@ -1771,7 +1849,7 @@ class AsyncCrawlerTestCase(unittest.IsolatedAsyncioTestCase):
         joined_logs = "\n".join(captured_logs.output)
         self.assertIn("Starting download", joined_logs)
         self.assertIn("Completed download", joined_logs)
-        self.assertIn("HTTP error", joined_logs)
+        self.assertIn("Retry scheduled", joined_logs)
 
     async def test_fetch_and_parse_returns_parsed_page_data(self) -> None:
         crawler = AsyncCrawler(max_concurrent=2)
@@ -1885,19 +1963,92 @@ class AsyncCrawlerTestCase(unittest.IsolatedAsyncioTestCase):
             backoff_base=0.12,
             backoff_factor=2.0,
             backoff_max=0.5,
+            retry_strategy=RetryStrategy(max_retries=1, base_delay=0.01),
         )
 
         first = await crawler.fetch_url(f"{self.base_url}/flaky")
+        self.flaky_status_hits = 0
         started_at = time.perf_counter()
         second = await crawler.fetch_url(f"{self.base_url}/flaky")
         elapsed = time.perf_counter() - started_at
         stats = crawler._get_crawl_stats(CrawlerQueue())
         await crawler.close()
 
-        self.assertEqual(first, "")
+        self.assertEqual(first, "recovered")
         self.assertEqual(second, "recovered")
         self.assertGreaterEqual(elapsed, 0.10)
         self.assertGreaterEqual(int(stats["backoff_count"]), 1)
+
+    async def test_fetch_url_retries_500_and_succeeds(self) -> None:
+        crawler = AsyncCrawler(
+            max_concurrent=1,
+            requests_per_second=100.0,
+            respect_robots=False,
+            min_delay=0.0,
+            jitter=0.0,
+            retry_strategy=RetryStrategy(max_retries=2, base_delay=0.01),
+        )
+
+        content = await crawler.fetch_url(f"{self.base_url}/flaky")
+        retry_stats = crawler.retry_strategy.get_stats()
+        await crawler.close()
+
+        self.assertEqual(content, "recovered")
+        self.assertEqual(len(self.request_times.get("/flaky", [])), 2)
+        self.assertGreaterEqual(int(retry_stats["successful_retries"]), 1)
+        self.assertGreaterEqual(int(retry_stats["retry_attempts_total"]), 1)
+
+    async def test_fetch_url_does_not_retry_404(self) -> None:
+        crawler = AsyncCrawler(
+            max_concurrent=1,
+            requests_per_second=100.0,
+            respect_robots=False,
+            min_delay=0.0,
+            jitter=0.0,
+            retry_strategy=RetryStrategy(max_retries=3, base_delay=0.01),
+        )
+
+        content = await crawler.fetch_url(f"{self.base_url}/status/404")
+        retry_stats = crawler.retry_strategy.get_stats()
+        await crawler.close()
+
+        self.assertEqual(content, "")
+        self.assertEqual(len(self.request_times.get("/status", [])), 1)
+        self.assertEqual(dict(crawler.error_details)[f"{self.base_url}/status/404"]["type"], "PermanentError")
+        self.assertEqual(int(retry_stats["retry_attempts_total"]), 0)
+
+    async def test_fetch_and_parse_records_parse_error(self) -> None:
+        class BrokenParser:
+            async def parse_html(self, html: str, url: str) -> dict[str, object]:
+                raise ValueError("cannot parse")
+
+            def empty_result(self, url: str) -> dict[str, object]:
+                return {
+                    "url": url,
+                    "title": "",
+                    "text": "",
+                    "links": [],
+                    "metadata": {},
+                    "images": [],
+                    "headings": [],
+                    "tables": [],
+                    "lists": [],
+                }
+
+        crawler = AsyncCrawler(
+            max_concurrent=1,
+            requests_per_second=100.0,
+            respect_robots=False,
+            html_parser=BrokenParser(),
+        )
+
+        result = await crawler.fetch_and_parse(f"{self.base_url}/html")
+        retry_stats = crawler.retry_strategy.get_stats()
+        await crawler.close()
+
+        self.assertEqual(result["url"], f"{self.base_url}/html")
+        self.assertEqual(dict(crawler.error_details)[f"{self.base_url}/html"]["type"], "ParseError")
+        self.assertEqual(dict(retry_stats["error_counts_by_type"])["ParseError"], 1)
 
     async def test_crawl_respects_max_depth(self) -> None:
         crawler = AsyncCrawler(max_concurrent=3, max_depth=1)
@@ -1937,7 +2088,7 @@ class AsyncCrawlerTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all("external.example.org" not in url for url in processed_urls))
 
     async def test_crawl_collects_stats_and_state(self) -> None:
-        crawler = AsyncCrawler(max_concurrent=2, max_depth=2, per_domain_concurrent=1)
+        crawler = AsyncCrawler(max_concurrent=2, max_depth=2, per_domain_concurrent=1, retry_strategy=RetryStrategy(max_retries=1, base_delay=0.01))
 
         with self.assertLogs("src.models", level="INFO") as captured_logs:
             result = await crawler.crawl(
@@ -1953,6 +2104,7 @@ class AsyncCrawlerTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertIn(f"{self.base_url}/status/404", dict(result["failed_urls"]))
         self.assertIn("Crawl progress", "\n".join(captured_logs.output))
         self.assertEqual(dict(stats["semaphores"])["per_domain_concurrent"], 1)
+        self.assertIn("retry", stats)
 
     async def test_crawl_blocks_urls_disallowed_by_robots(self) -> None:
         self.robots_txt = "User-agent: *\nDisallow: /crawl/blocked\n"
@@ -2089,6 +2241,30 @@ class AsyncCrawlerTestCase(unittest.IsolatedAsyncioTestCase):
         payload = json.loads(output_path.read_text(encoding="utf-8"))
         self.assertEqual(dict(payload["blocked_urls"])["https://example.com/admin"], "blocked by robots.txt")
         self.assertEqual(dict(result["stats"])["robots_blocked"], 1)
+
+    async def test_run_retry_demo_writes_json_output(self) -> None:
+        original_fetch_urls = AsyncCrawler.fetch_urls
+
+        async def fake_fetch_urls(self, urls: list[str]) -> dict[str, str]:
+            self.error_details = {urls[1]: {"type": "TransientError", "message": "HTTP 503: busy"}}
+            self.retry_strategy._retry_attempts_total = 2
+            self.retry_strategy._successful_retries = 1
+            self.retry_strategy._total_retry_delay = 0.3
+            self.retry_strategy._error_counts_by_type = {"TransientError": 1, "PermanentError": 1}
+            self.retry_strategy._permanent_error_urls = {urls[2]}
+            return {urls[0]: "ok", urls[1]: "", urls[2]: ""}
+
+        AsyncCrawler.fetch_urls = fake_fetch_urls
+        try:
+            result = await run_retry_demo()
+        finally:
+            AsyncCrawler.fetch_urls = original_fetch_urls
+
+        output_path = Path(str(result["output_path"]))
+        self.assertTrue(output_path.exists())
+        payload = json.loads(output_path.read_text(encoding="utf-8"))
+        self.assertEqual(dict(payload["error_details"])["https://httpbin.org/status/503"]["type"], "TransientError")
+        self.assertEqual(dict(result["retry_stats"])["successful_retries"], 1)
 
 
 if __name__ == "__main__":

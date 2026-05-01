@@ -10,6 +10,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from enum import Enum
 import heapq
+import inspect
 import json
 import logging
 from pathlib import Path
@@ -2730,6 +2731,207 @@ class RobotsParser:
         }
 
 
+class CrawlerError(Exception):
+    def __init__(
+        self,
+        message: str,
+        url: str = "",
+        original_error: Exception | None = None,
+        status_code: int | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.url = url
+        self.original_error = original_error
+        self.status_code = status_code
+
+
+class TransientError(CrawlerError):
+    pass
+
+
+class PermanentError(CrawlerError):
+    pass
+
+
+class NetworkError(CrawlerError):
+    pass
+
+
+class ParseError(CrawlerError):
+    pass
+
+
+class RetryStrategy:
+    def __init__(
+        self,
+        max_retries: int = 3,
+        backoff_factor: float = 2.0,
+        retry_on: list | None = None,
+        base_delay: float = 0.5,
+        max_delay: float = 30.0,
+        timeout_backoff_factor: float = 1.5,
+        max_retries_by_error: dict[type[Exception], int] | None = None,
+    ) -> None:
+        if not isinstance(max_retries, int) or max_retries < 0:
+            raise InvalidOperationError("max_retries must be a non-negative integer")
+        if not isinstance(backoff_factor, (int, float)) or backoff_factor < 1:
+            raise InvalidOperationError("backoff_factor must be greater than or equal to 1")
+        if not isinstance(base_delay, (int, float)) or base_delay < 0:
+            raise InvalidOperationError("base_delay must be a non-negative number")
+        if not isinstance(max_delay, (int, float)) or max_delay < 0:
+            raise InvalidOperationError("max_delay must be a non-negative number")
+        if not isinstance(timeout_backoff_factor, (int, float)) or timeout_backoff_factor < 1:
+            raise InvalidOperationError("timeout_backoff_factor must be greater than or equal to 1")
+        if retry_on is None:
+            retry_on = [TransientError, NetworkError]
+        if not isinstance(retry_on, list) or not all(isinstance(item, type) and issubclass(item, Exception) for item in retry_on):
+            raise InvalidOperationError("retry_on must be a list of exception classes")
+        if max_retries_by_error is not None:
+            if not isinstance(max_retries_by_error, dict):
+                raise InvalidOperationError("max_retries_by_error must be a dictionary")
+            for error_type, retries in max_retries_by_error.items():
+                if not isinstance(error_type, type) or not issubclass(error_type, Exception):
+                    raise InvalidOperationError("max_retries_by_error keys must be exception classes")
+                if not isinstance(retries, int) or retries < 0:
+                    raise InvalidOperationError("max_retries_by_error values must be non-negative integers")
+        self.max_retries = max_retries
+        self.backoff_factor = float(backoff_factor)
+        self.retry_on = tuple(retry_on)
+        self.base_delay = float(base_delay)
+        self.max_delay = float(max_delay)
+        self.timeout_backoff_factor = float(timeout_backoff_factor)
+        self.max_retries_by_error = dict(max_retries_by_error or {})
+        self.reset_stats()
+
+    @staticmethod
+    def _extract_url(args: tuple[object, ...], kwargs: dict[str, object]) -> str:
+        if isinstance(kwargs.get("url"), str):
+            return str(kwargs["url"])
+        if args and isinstance(args[0], str):
+            return str(args[0])
+        return ""
+
+    def classify_error(self, error: Exception, url: str = "") -> CrawlerError:
+        if isinstance(error, CrawlerError):
+            if not error.url and url:
+                error.url = url
+            return error
+        if isinstance(error, asyncio.TimeoutError):
+            return TransientError("request timeout", url=url, original_error=error)
+        if isinstance(error, aiohttp.ClientResponseError):
+            message = f"HTTP {error.status}: {error.message}"
+            if error.status == 429 or 500 <= error.status < 600:
+                return TransientError(message, url=url, original_error=error, status_code=error.status)
+            if error.status in (401, 403, 404) or 400 <= error.status < 500:
+                return PermanentError(message, url=url, original_error=error, status_code=error.status)
+        if isinstance(error, aiohttp.ClientError):
+            return NetworkError(str(error), url=url, original_error=error)
+        if isinstance(error, OSError):
+            return NetworkError(str(error), url=url, original_error=error)
+        return PermanentError(str(error), url=url, original_error=error)
+
+    def record_error(self, error: Exception, url: str = "") -> CrawlerError:
+        classified_error = self.classify_error(error, url=url)
+        error_type = type(classified_error).__name__
+        self._error_counts_by_type[error_type] = self._error_counts_by_type.get(error_type, 0) + 1
+        if isinstance(classified_error, PermanentError) and classified_error.url:
+            self._permanent_error_urls.add(classified_error.url)
+        return classified_error
+
+    def _resolve_max_retries(self, error: Exception) -> int:
+        for error_type, retries in self.max_retries_by_error.items():
+            if isinstance(error, error_type):
+                return retries
+        return self.max_retries
+
+    def _should_retry(self, error: Exception) -> bool:
+        return isinstance(error, self.retry_on)
+
+    def _get_delay_multiplier(self, error: Exception) -> float:
+        if isinstance(error, NetworkError):
+            return 0.5
+        if isinstance(error, TransientError) and getattr(error, "status_code", None) == 429:
+            return 2.0
+        return 1.0
+
+    def _get_delay(self, error: Exception, attempt_number: int) -> float:
+        delay = self.base_delay * self._get_delay_multiplier(error) * (self.backoff_factor ** max(0, attempt_number - 1))
+        return min(self.max_delay, delay)
+
+    def get_timeout_multiplier(self, attempt_number: int) -> float:
+        return self.timeout_backoff_factor ** max(0, attempt_number - 1)
+
+    async def _invoke(self, coro, args: tuple[object, ...], kwargs: dict[str, object], attempt_number: int, last_error: Exception | None):
+        call_kwargs = dict(kwargs)
+        try:
+            signature = inspect.signature(coro)
+            supports_kwargs = any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in signature.parameters.values())
+            if supports_kwargs or "_retry_attempt" in signature.parameters:
+                call_kwargs["_retry_attempt"] = attempt_number
+            if supports_kwargs or "_retry_error" in signature.parameters:
+                call_kwargs["_retry_error"] = last_error
+        except (TypeError, ValueError):
+            pass
+        return await coro(*args, **call_kwargs)
+
+    async def execute_with_retry(self, coro, *args, **kwargs):
+        url = self._extract_url(args, kwargs)
+        attempt_number = 1
+        last_error: Exception | None = None
+        while True:
+            try:
+                result = await self._invoke(coro, args, kwargs, attempt_number, last_error)
+                if attempt_number > 1:
+                    self._successful_retries += 1
+                return result
+            except Exception as error:
+                classified_error = self.record_error(error, url=url)
+                max_retries_for_error = self._resolve_max_retries(classified_error)
+                should_retry = self._should_retry(classified_error) and attempt_number - 1 < max_retries_for_error
+                if not should_retry:
+                    logger.warning(
+                        "Retry finished with failure for %s on attempt %s: %s (%s)",
+                        url or "<unknown>",
+                        attempt_number,
+                        classified_error,
+                        type(classified_error).__name__,
+                    )
+                    raise classified_error
+                delay = self._get_delay(classified_error, attempt_number)
+                self._retry_attempts_total += 1
+                self._total_retry_delay += delay
+                logger.info(
+                    "Retry scheduled for %s on attempt %s/%s after %.2fs due to %s (%s)",
+                    url or "<unknown>",
+                    attempt_number,
+                    max_retries_for_error + 1,
+                    delay,
+                    classified_error,
+                    type(classified_error).__name__,
+                )
+                await asyncio.sleep(delay)
+                last_error = classified_error
+                attempt_number += 1
+
+    def get_stats(self) -> dict[str, object]:
+        return {
+            "max_retries": self.max_retries,
+            "backoff_factor": self.backoff_factor,
+            "retry_attempts_total": self._retry_attempts_total,
+            "successful_retries": self._successful_retries,
+            "average_retry_delay": self._total_retry_delay / self._retry_attempts_total if self._retry_attempts_total else 0.0,
+            "error_counts_by_type": dict(self._error_counts_by_type),
+            "permanent_error_urls": sorted(self._permanent_error_urls),
+        }
+
+    def reset_stats(self) -> None:
+        self._retry_attempts_total = 0
+        self._successful_retries = 0
+        self._total_retry_delay = 0.0
+        self._error_counts_by_type: dict[str, int] = {}
+        self._permanent_error_urls: set[str] = set()
+
+
 class AsyncCrawler:
     def __init__(
         self,
@@ -2750,6 +2952,7 @@ class AsyncCrawler:
         backoff_base: float = 0.5,
         backoff_factor: float = 2.0,
         backoff_max: float = 30.0,
+        retry_strategy: RetryStrategy | None = None,
     ) -> None:
         if not isinstance(max_concurrent, int) or max_concurrent < 1:
             raise InvalidOperationError("max_concurrent must be a positive integer")
@@ -2780,9 +2983,14 @@ class AsyncCrawler:
             raise InvalidOperationError("backoff_factor must be greater than or equal to 1")
         if not isinstance(backoff_max, (int, float)) or backoff_max < 0:
             raise InvalidOperationError("backoff_max must be a non-negative number")
+        if retry_strategy is not None and not isinstance(retry_strategy, RetryStrategy):
+            raise InvalidOperationError("retry_strategy must be an instance of RetryStrategy")
         self.max_concurrent = max_concurrent
         self.max_depth = max_depth
         self.per_domain_concurrent = per_domain_concurrent
+        self.connect_timeout = float(connect_timeout)
+        self.read_timeout = float(read_timeout)
+        self.total_timeout = float(total_timeout)
         self.requests_per_second = float(requests_per_second)
         self.rate_limit_per_domain = rate_limit_per_domain
         self.respect_robots = respect_robots
@@ -2803,11 +3011,13 @@ class AsyncCrawler:
         self.semaphore_manager = SemaphoreManager(max_concurrent=max_concurrent, per_domain_concurrent=per_domain_concurrent)
         self.rate_limiter = RateLimiter(requests_per_second=self.requests_per_second, per_domain=self.rate_limit_per_domain)
         self.robots_parser = RobotsParser(timeout=connect_timeout, user_agent=self.user_agent)
+        self.retry_strategy = retry_strategy if retry_strategy is not None else RetryStrategy()
         self.visited_urls: set[str] = set()
         self.failed_urls: dict[str, str] = {}
         self.processed_urls: dict[str, dict[str, object]] = {}
         self.url_depths: dict[str, int] = {}
         self.blocked_urls: dict[str, str] = {}
+        self.error_details: dict[str, dict[str, object]] = {}
         self._crawl_started_at = 0.0
         self._request_delay_total = 0.0
         self._request_delay_count = 0
@@ -2872,6 +3082,8 @@ class AsyncCrawler:
         self.processed_urls.clear()
         self.url_depths.clear()
         self.blocked_urls.clear()
+        self.error_details.clear()
+        self.retry_strategy.reset_stats()
         self._crawl_started_at = perf_counter()
         self._request_delay_total = 0.0
         self._request_delay_count = 0
@@ -2905,6 +3117,7 @@ class AsyncCrawler:
         stats["semaphores"] = self.semaphore_manager.get_stats()
         stats["rate_limiter"] = self.rate_limiter.get_stats()
         stats["robots"] = self.robots_parser.get_stats()
+        stats["retry"] = self.retry_strategy.get_stats()
         return stats
 
     def _log_crawl_progress(self, queue: CrawlerQueue) -> None:
@@ -2962,6 +3175,14 @@ class AsyncCrawler:
         if domain:
             self._domain_backoffs[domain] = 0.0
 
+    def _get_attempt_timeout(self, attempt_number: int) -> aiohttp.ClientTimeout:
+        multiplier = self.retry_strategy.get_timeout_multiplier(attempt_number)
+        return aiohttp.ClientTimeout(
+            total=self.total_timeout * multiplier,
+            connect=self.connect_timeout * multiplier,
+            sock_read=self.read_timeout * multiplier,
+        )
+
     async def _apply_politeness(self, url: str, user_agent: str) -> str | None:
         domain = urlparse(url).netloc
         base_url = self._get_base_url(url)
@@ -2985,43 +3206,68 @@ class AsyncCrawler:
             self._record_request_delay(total_delay)
         return None
 
+    async def _fetch_url_once(
+        self,
+        url: str,
+        request_user_agent: str,
+        _retry_attempt: int = 1,
+        _retry_error: Exception | None = None,
+    ) -> str:
+        if not self._is_supported_url(url):
+            raise PermanentError("unsupported url", url=url)
+
+        async with self.semaphore_manager.limit(url):
+            polite_error = await self._apply_politeness(url, request_user_agent)
+            if polite_error is not None:
+                raise PermanentError(polite_error, url=url)
+            logger.info("Starting download attempt %s: %s", _retry_attempt, url)
+            self._record_request_start()
+            domain = urlparse(url).netloc
+            try:
+                session = await self._ensure_session()
+                async with session.get(
+                    url,
+                    headers={"User-Agent": request_user_agent},
+                    timeout=self._get_attempt_timeout(_retry_attempt),
+                ) as response:
+                    response.raise_for_status()
+                    content = await response.text()
+                    self._reset_backoff(domain)
+                    logger.info("Completed download on attempt %s: %s", _retry_attempt, url)
+                    return content
+            except aiohttp.ClientResponseError as error:
+                if self._should_backoff(error):
+                    self._increase_backoff(domain)
+                logger.warning("HTTP error for %s on attempt %s: %s", url, _retry_attempt, error)
+                raise self.retry_strategy.classify_error(error, url=url)
+            except asyncio.TimeoutError as error:
+                if self._should_backoff(error):
+                    self._increase_backoff(domain)
+                logger.warning("Timeout error for %s on attempt %s: %s", url, _retry_attempt, error)
+                raise self.retry_strategy.classify_error(error, url=url)
+            except aiohttp.ClientError as error:
+                if self._should_backoff(error):
+                    self._increase_backoff(domain)
+                logger.warning("Network error for %s on attempt %s: %s", url, _retry_attempt, error)
+                raise self.retry_strategy.classify_error(error, url=url)
+
     async def _fetch_url_with_error(self, url: str) -> tuple[str, str | None]:
         if not self._is_supported_url(url):
             error = "unsupported url"
             logger.warning("Unsupported URL skipped: %s", url)
             return "", error
-
-        async with self.semaphore_manager.limit(url):
-            request_user_agent = await self._get_request_user_agent()
-            polite_error = await self._apply_politeness(url, request_user_agent)
-            if polite_error is not None:
-                return "", polite_error
-            logger.info("Starting download: %s", url)
-            self._record_request_start()
-            domain = urlparse(url).netloc
-            try:
-                session = await self._ensure_session()
-                async with session.get(url, headers={"User-Agent": request_user_agent}) as response:
-                    response.raise_for_status()
-                    content = await response.text()
-                    self._reset_backoff(domain)
-                    logger.info("Completed download: %s", url)
-                    return content, None
-            except aiohttp.ClientResponseError as error:
-                if self._should_backoff(error):
-                    self._increase_backoff(domain)
-                logger.warning("HTTP error for %s: %s", url, error)
-                return "", str(error)
-            except asyncio.TimeoutError as error:
-                if self._should_backoff(error):
-                    self._increase_backoff(domain)
-                logger.warning("Timeout error for %s: %s", url, error)
-                return "", str(error)
-            except aiohttp.ClientError as error:
-                if self._should_backoff(error):
-                    self._increase_backoff(domain)
-                logger.warning("Network error for %s: %s", url, error)
-                return "", str(error)
+        request_user_agent = await self._get_request_user_agent()
+        try:
+            content = await self.retry_strategy.execute_with_retry(self._fetch_url_once, url, request_user_agent)
+            return content, None
+        except CrawlerError as error:
+            if isinstance(error, PermanentError) and str(error) == "blocked by robots.txt":
+                self.blocked_urls[url] = str(error)
+            self.error_details[url] = {
+                "type": type(error).__name__,
+                "message": str(error),
+            }
+            return "", str(error)
 
     async def fetch_url(self, url: str) -> str:
         content, _error = await self._fetch_url_with_error(url)
@@ -3036,7 +3282,16 @@ class AsyncCrawler:
         html = await self.fetch_url(url)
         if not html:
             return self.html_parser.empty_result(url)
-        return await self.html_parser.parse_html(html, url)
+        try:
+            return await self.html_parser.parse_html(html, url)
+        except Exception as error:
+            parse_error = self.retry_strategy.record_error(ParseError(str(error), url=url, original_error=error), url=url)
+            self.error_details[url] = {
+                "type": type(parse_error).__name__,
+                "message": str(parse_error),
+            }
+            logger.warning("Parse error for %s: %s", url, parse_error)
+            return self.html_parser.empty_result(url)
 
     async def _enqueue_url(
         self,
@@ -3095,7 +3350,18 @@ class AsyncCrawler:
             self._log_crawl_progress(queue)
             return
 
-        parsed_result = await self.html_parser.parse_html(content, url)
+        try:
+            parsed_result = await self.html_parser.parse_html(content, url)
+        except Exception as error:
+            parse_error = self.retry_strategy.record_error(ParseError(str(error), url=url, original_error=error), url=url)
+            queue.mark_failed(url, str(parse_error))
+            self.failed_urls[url] = str(parse_error)
+            self.error_details[url] = {
+                "type": type(parse_error).__name__,
+                "message": str(parse_error),
+            }
+            self._log_crawl_progress(queue)
+            return
         parsed_result["depth"] = depth
         self.processed_urls[url] = parsed_result
         queue.mark_processed(url)
@@ -3197,6 +3463,7 @@ class AsyncCrawler:
             "processed_urls": dict(self.processed_urls),
             "failed_urls": dict(self.failed_urls),
             "blocked_urls": dict(self.blocked_urls),
+            "error_details": dict(self.error_details),
             "visited_urls": sorted(self.visited_urls),
             "stats": self._get_crawl_stats(queue),
         }

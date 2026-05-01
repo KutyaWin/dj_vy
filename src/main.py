@@ -818,6 +818,65 @@ def print_polite_crawl_demo_summary(result: dict[str, object]) -> None:
         print(f"- blocked={url} | reason={reason}")
 
 
+async def run_retry_demo() -> dict[str, object]:
+    urls = [
+        "https://example.com",
+        "https://httpbin.org/status/503",
+        "https://httpbin.org/status/404",
+    ]
+    crawler = AsyncCrawler(
+        max_concurrent=2,
+        per_domain_concurrent=1,
+        requests_per_second=2.0,
+        respect_robots=True,
+        min_delay=0.1,
+        jitter=0.0,
+        user_agent="RetryBot/1.0",
+    )
+    results: dict[str, str] = {}
+    elapsed = 0.0
+    output_dir = Path(tempfile.gettempdir()) / "dj_vy_retry_demo"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = output_dir / "retry_report.json"
+    try:
+        started_at = perf_counter()
+        results = await crawler.fetch_urls(urls)
+        elapsed = perf_counter() - started_at
+    finally:
+        retry_stats = crawler.retry_strategy.get_stats()
+        error_details = dict(crawler.error_details)
+        await crawler.close()
+
+    payload = {
+        "urls": urls,
+        "results": results,
+        "retry_stats": retry_stats,
+        "error_details": error_details,
+    }
+    output_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return {
+        "urls": urls,
+        "results": results,
+        "retry_stats": retry_stats,
+        "error_details": error_details,
+        "elapsed": elapsed,
+        "output_path": str(output_path),
+    }
+
+
+def print_retry_demo_summary(result: dict[str, object]) -> None:
+    print_section("RETRY ERROR HANDLING DEMONSTRATION")
+    print(f"URLs: {', '.join(list(result['urls']))}")
+    print(f"Output JSON: {result['output_path']}")
+    print(f"Elapsed: {float(result['elapsed']):.2f}s")
+    retry_stats = dict(result["retry_stats"])
+    print(f"Retry attempts total: {retry_stats.get('retry_attempts_total', 0)}")
+    print(f"Successful retries: {retry_stats.get('successful_retries', 0)}")
+    print(f"Average retry delay: {float(retry_stats.get('average_retry_delay', 0.0)):.2f}s")
+    for url, error in dict(result["error_details"]).items():
+        print(f"- error_url={url} | type={error.get('type', '')} | message={error.get('message', '')}")
+
+
 def main() -> None:
     print_section("BANKING SYSTEM DEMONSTRATION")
     bank, processor, queue, clients, accounts, phase_times, audit_log_path = build_demo_bank()
