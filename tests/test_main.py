@@ -4,8 +4,10 @@ import aiohttp
 from bs4 import BeautifulSoup
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+import csv
 import json
 from pathlib import Path
+import sqlite3
 import socket
 import tempfile
 import time
@@ -26,6 +28,7 @@ from src.models import (
     CrawlerQueue,
     Currency,
     InvestmentAccount,
+    JSONStorage,
     HTMLParser,
     InsufficientFundsError,
     InvalidOperationError,
@@ -40,6 +43,7 @@ from src.models import (
     RetryStrategy,
     RobotsParser,
     SavingsAccount,
+    SQLiteStorage,
     SemaphoreManager,
     TransientError,
     Transaction,
@@ -47,8 +51,9 @@ from src.models import (
     TransactionQueue,
     TransactionStatus,
     TransactionType,
+    CSVStorage,
 )
-from src.main import build_demo_bank, fetch_urls_sequentially, generate_report_artifacts, run_async_crawler_demo, run_html_parser_demo, run_polite_crawl_demo, run_retry_demo, run_site_crawl_demo
+from src.main import build_demo_bank, fetch_urls_sequentially, generate_report_artifacts, run_async_crawler_demo, run_html_parser_demo, run_polite_crawl_demo, run_retry_demo, run_site_crawl_demo, run_storage_demo
 
 
 class BankAccountTestCase(unittest.TestCase):
@@ -1600,6 +1605,141 @@ class RetryStrategyTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(dict(strategy.get_stats()["error_counts_by_type"])["ParseError"], 1)
 
 
+class StorageTestCase(unittest.IsolatedAsyncioTestCase):
+    async def test_json_storage_writes_jsonl_records(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            file_path = Path(tmp_dir) / "results.jsonl"
+            storage = JSONStorage(str(file_path), buffer_size=2)
+
+            await storage.save(
+                {
+                    "url": "https://example.com/1",
+                    "title": "First",
+                    "text": "Hello",
+                    "links": ["https://example.com/2"],
+                    "metadata": {"description": "demo"},
+                    "status_code": 200,
+                    "content_type": "text/html",
+                }
+            )
+            await storage.save(
+                {
+                    "url": "https://example.com/2",
+                    "title": "Second",
+                    "text": "World",
+                    "links": [],
+                    "metadata": {},
+                    "status_code": 200,
+                    "content_type": "text/html",
+                }
+            )
+            await storage.close()
+
+            lines = [line for line in file_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+            payload = [json.loads(line) for line in lines]
+            self.assertEqual(len(payload), 2)
+            self.assertEqual(payload[0]["url"], "https://example.com/1")
+            self.assertEqual(storage.get_stats()["saved_count"], 2)
+
+    async def test_csv_storage_writes_headers_and_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            file_path = Path(tmp_dir) / "results.csv"
+            storage = CSVStorage(str(file_path), buffer_size=1)
+
+            await storage.save(
+                {
+                    "url": "https://example.com/page",
+                    "title": "Page, with comma",
+                    "text": "Body with \"quotes\"",
+                    "links": ["https://example.com/next"],
+                    "metadata": {"lang": "ru"},
+                    "status_code": 200,
+                    "content_type": "text/html",
+                }
+            )
+            await storage.close()
+
+            with file_path.open("r", encoding="utf-8", newline="") as file:
+                rows = list(csv.DictReader(file))
+
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["url"], "https://example.com/page")
+            self.assertIn("Page, with comma", rows[0]["title"])
+            self.assertEqual(json.loads(rows[0]["metadata"])["lang"], "ru")
+
+    async def test_sqlite_storage_inserts_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            db_path = Path(tmp_dir) / "results.sqlite3"
+            storage = SQLiteStorage(str(db_path), batch_size=2)
+
+            await storage.save(
+                {
+                    "url": "https://example.com/1",
+                    "title": "First",
+                    "text": "A",
+                    "links": [],
+                    "metadata": {},
+                    "status_code": 200,
+                    "content_type": "text/html",
+                }
+            )
+            await storage.save(
+                {
+                    "url": "https://example.com/2",
+                    "title": "Second",
+                    "text": "B",
+                    "links": ["https://example.com/3"],
+                    "metadata": {"k": "v"},
+                    "status_code": 200,
+                    "content_type": "text/html",
+                }
+            )
+            await storage.close()
+
+            connection = sqlite3.connect(db_path)
+            try:
+                rows_count = int(connection.execute("SELECT COUNT(*) FROM pages").fetchone()[0])
+                title = str(connection.execute("SELECT title FROM pages WHERE url = ?", ("https://example.com/2",)).fetchone()[0])
+            finally:
+                connection.close()
+
+            self.assertEqual(rows_count, 2)
+            self.assertEqual(title, "Second")
+
+    async def test_storage_retries_write_error(self) -> None:
+        class FlakyJSONStorage(JSONStorage):
+            def __init__(self, file_path: str) -> None:
+                super().__init__(file_path, buffer_size=1, retry_strategy=RetryStrategy(max_retries=1, base_delay=0.01))
+                self.calls = 0
+
+            async def _write_lines(self, records: list[dict[str, object]]) -> None:
+                self.calls += 1
+                if self.calls == 1:
+                    raise OSError("temporary disk issue")
+                await super()._write_lines(records)
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            file_path = Path(tmp_dir) / "results.jsonl"
+            storage = FlakyJSONStorage(str(file_path))
+
+            await storage.save(
+                {
+                    "url": "https://example.com/retry",
+                    "title": "Retry",
+                    "text": "ok",
+                    "links": [],
+                    "metadata": {},
+                    "status_code": 200,
+                    "content_type": "text/html",
+                }
+            )
+            await storage.close()
+
+            lines = [line for line in file_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+            self.assertEqual(len(lines), 1)
+            self.assertGreaterEqual(storage.retry_strategy.get_stats()["retry_attempts_total"], 1)
+
+
 class AsyncCrawlerTestCase(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self.robots_txt = "User-agent: *\nDisallow:\n"
@@ -2128,6 +2268,57 @@ class AsyncCrawlerTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.request_times.get("/crawl/blocked", [])), 0)
         self.assertGreaterEqual(int(dict(result["stats"])["robots_blocked"]), 1)
 
+    async def test_crawl_saves_processed_pages_to_json_storage(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            storage_path = Path(tmp_dir) / "crawl.jsonl"
+            storage = JSONStorage(str(storage_path), buffer_size=1)
+            crawler = AsyncCrawler(
+                max_concurrent=2,
+                max_depth=1,
+                requests_per_second=100.0,
+                respect_robots=False,
+                storage=storage,
+            )
+
+            result = await crawler.crawl(
+                start_urls=[f"{self.base_url}/crawl/root"],
+                max_pages=3,
+                same_domain_only=True,
+            )
+            await crawler.close()
+
+            lines = [line for line in storage_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+            payload = [json.loads(line) for line in lines]
+            self.assertGreaterEqual(len(payload), 1)
+            self.assertEqual(payload[0]["status_code"], 200)
+            self.assertIn("storage", dict(result["stats"]))
+
+    async def test_crawl_continues_when_storage_save_fails(self) -> None:
+        class BrokenStorage(JSONStorage):
+            async def save(self, data: dict) -> None:
+                raise OSError("disk full")
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            storage = BrokenStorage(str(Path(tmp_dir) / "broken.jsonl"))
+            crawler = AsyncCrawler(
+                max_concurrent=2,
+                max_depth=1,
+                requests_per_second=100.0,
+                respect_robots=False,
+                storage=storage,
+            )
+
+            result = await crawler.crawl(
+                start_urls=[f"{self.base_url}/crawl/root"],
+                max_pages=2,
+                same_domain_only=True,
+            )
+            await crawler.close()
+
+            self.assertGreaterEqual(len(dict(result["processed_urls"])), 1)
+            self.assertGreaterEqual(len(dict(result["storage_errors"])), 1)
+            self.assertGreaterEqual(int(dict(result["stats"])["storage_errors"]), 1)
+
     async def test_run_async_crawler_demo_returns_expected_shape(self) -> None:
         original_fetch_urls = AsyncCrawler.fetch_urls
         original_fetch_url = AsyncCrawler.fetch_url
@@ -2265,6 +2456,45 @@ class AsyncCrawlerTestCase(unittest.IsolatedAsyncioTestCase):
         payload = json.loads(output_path.read_text(encoding="utf-8"))
         self.assertEqual(dict(payload["error_details"])["https://httpbin.org/status/503"]["type"], "TransientError")
         self.assertEqual(dict(result["retry_stats"])["successful_retries"], 1)
+
+    async def test_run_storage_demo_returns_saved_counts(self) -> None:
+        original_crawl = AsyncCrawler.crawl
+
+        async def fake_crawl(self, start_urls: list[str], max_pages: int = 100, same_domain_only: bool = False, include_patterns=None, exclude_patterns=None, max_depth=None) -> dict[str, object]:
+            sample_record = {
+                "url": start_urls[0],
+                "title": "Stored page",
+                "text": "body",
+                "links": [],
+                "metadata": {},
+                "crawled_at": datetime.now(timezone.utc).isoformat(),
+                "status_code": 200,
+                "content_type": "text/html",
+            }
+            if self.storage is not None:
+                await self.storage.save(sample_record)
+            return {
+                "processed_urls": {start_urls[0]: {"url": start_urls[0], "title": "Stored page", "text": "body", "links": [], "metadata": {}, "images": [], "headings": [], "tables": [], "lists": [], "depth": 0}},
+                "failed_urls": {},
+                "blocked_urls": {},
+                "error_details": {},
+                "storage_errors": {},
+                "visited_urls": start_urls,
+                "stats": {"processed_pages": 1, "failed_pages": 0, "storage": self.storage.get_stats() if self.storage is not None else {}},
+            }
+
+        AsyncCrawler.crawl = fake_crawl
+        try:
+            result = await run_storage_demo()
+        finally:
+            AsyncCrawler.crawl = original_crawl
+
+        self.assertTrue(Path(str(result["json_output_path"])).exists())
+        self.assertTrue(Path(str(result["csv_output_path"])).exists())
+        self.assertTrue(Path(str(result["sqlite_output_path"])).exists())
+        self.assertGreaterEqual(int(result["json_records"]), 1)
+        self.assertGreaterEqual(int(result["csv_records"]), 1)
+        self.assertGreaterEqual(int(result["sqlite_rows"]), 1)
 
 
 if __name__ == "__main__":

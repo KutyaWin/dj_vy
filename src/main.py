@@ -13,11 +13,14 @@ try:
         AbstractAccount,
         AsyncCrawler,
         Bank,
+        CSVStorage,
         Client,
         HTMLParser,
         InvalidOperationError,
+        JSONStorage,
         ReportBuilder,
         RiskLevel,
+        SQLiteStorage,
         Transaction,
         TransactionProcessor,
         TransactionQueue,
@@ -29,11 +32,14 @@ except ImportError:
         AbstractAccount,
         AsyncCrawler,
         Bank,
+        CSVStorage,
         Client,
         HTMLParser,
         InvalidOperationError,
+        JSONStorage,
         ReportBuilder,
         RiskLevel,
+        SQLiteStorage,
         Transaction,
         TransactionProcessor,
         TransactionQueue,
@@ -875,6 +881,77 @@ def print_retry_demo_summary(result: dict[str, object]) -> None:
     print(f"Average retry delay: {float(retry_stats.get('average_retry_delay', 0.0)):.2f}s")
     for url, error in dict(result["error_details"]).items():
         print(f"- error_url={url} | type={error.get('type', '')} | message={error.get('message', '')}")
+
+
+async def run_storage_demo() -> dict[str, object]:
+    start_urls = ["https://example.com"]
+    output_dir = Path(tempfile.gettempdir()) / "dj_vy_storage_demo"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    json_path = output_dir / "results.jsonl"
+    csv_path = output_dir / "results.csv"
+    sqlite_path = output_dir / "results.sqlite3"
+
+    async def crawl_with_storage(storage) -> dict[str, object]:
+        crawler = AsyncCrawler(
+            max_concurrent=2,
+            per_domain_concurrent=1,
+            max_depth=1,
+            html_parser=HTMLParser(),
+            requests_per_second=2.0,
+            respect_robots=True,
+            min_delay=0.1,
+            jitter=0.0,
+            storage=storage,
+        )
+        try:
+            return await crawler.crawl(start_urls=start_urls, max_pages=5, same_domain_only=True)
+        finally:
+            await crawler.close()
+
+    json_result = await crawl_with_storage(JSONStorage(str(json_path), buffer_size=1))
+    csv_result = await crawl_with_storage(CSVStorage(str(csv_path), buffer_size=1))
+    sqlite_result = await crawl_with_storage(SQLiteStorage(str(sqlite_path), batch_size=2))
+
+    json_lines = []
+    if json_path.exists():
+        json_lines = [line for line in json_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    csv_lines = []
+    if csv_path.exists():
+        csv_lines = [line for line in csv_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    sqlite_summary = {"rows": 0}
+    if sqlite_path.exists():
+        import sqlite3
+
+        connection = sqlite3.connect(sqlite_path)
+        try:
+            cursor = connection.execute("SELECT COUNT(*) FROM pages")
+            sqlite_summary["rows"] = int(cursor.fetchone()[0])
+        finally:
+            connection.close()
+
+    return {
+        "start_urls": start_urls,
+        "json_output_path": str(json_path),
+        "csv_output_path": str(csv_path),
+        "sqlite_output_path": str(sqlite_path),
+        "json_stats": dict(json_result["stats"]),
+        "csv_stats": dict(csv_result["stats"]),
+        "sqlite_stats": dict(sqlite_result["stats"]),
+        "json_records": len(json_lines),
+        "csv_records": max(0, len(csv_lines) - 1),
+        "sqlite_rows": sqlite_summary["rows"],
+    }
+
+
+def print_storage_demo_summary(result: dict[str, object]) -> None:
+    print_section("ASYNC STORAGE DEMONSTRATION")
+    print(f"Start URLs: {', '.join(list(result['start_urls']))}")
+    print(f"JSONL output: {result['json_output_path']}")
+    print(f"CSV output: {result['csv_output_path']}")
+    print(f"SQLite output: {result['sqlite_output_path']}")
+    print(f"JSON records: {result['json_records']}")
+    print(f"CSV records: {result['csv_records']}")
+    print(f"SQLite rows: {result['sqlite_rows']}")
 
 
 def main() -> None:

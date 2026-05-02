@@ -11,6 +11,7 @@ from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from enum import Enum
 import heapq
 import inspect
+import io
 import json
 import logging
 from pathlib import Path
@@ -21,6 +22,8 @@ from urllib.parse import urldefrag, urljoin, urlparse
 from uuid import uuid4
 
 import aiohttp
+import aiofiles
+import aiosqlite
 from bs4 import BeautifulSoup
 
 
@@ -41,6 +44,33 @@ def _normalize_utc_datetime(value: datetime, field_name: str) -> datetime:
     if value.tzinfo is None:
         return value.replace(tzinfo=timezone.utc)
     return value.astimezone(timezone.utc)
+
+
+def normalize_crawl_record(data: dict[str, object]) -> dict[str, object]:
+    if not isinstance(data, dict):
+        raise InvalidOperationError("data must be a dictionary")
+    url = str(data.get("url", "")).strip()
+    if not url:
+        raise InvalidOperationError("data['url'] must be a non-empty string")
+    crawled_at = data.get("crawled_at")
+    if isinstance(crawled_at, datetime):
+        crawled_at_value = _normalize_utc_datetime(crawled_at, "crawled_at").isoformat()
+    elif isinstance(crawled_at, str) and crawled_at.strip():
+        crawled_at_value = crawled_at.strip()
+    else:
+        crawled_at_value = _utc_now().isoformat()
+    links = data.get("links", [])
+    metadata = data.get("metadata", {})
+    return {
+        "url": url,
+        "title": str(data.get("title", "")),
+        "text": str(data.get("text", "")),
+        "links": list(links) if isinstance(links, (list, tuple, set)) else [],
+        "metadata": dict(metadata) if isinstance(metadata, dict) else {},
+        "crawled_at": crawled_at_value,
+        "status_code": int(data["status_code"]) if isinstance(data.get("status_code"), int) else None,
+        "content_type": str(data.get("content_type", "")),
+    }
 
 
 class AccountStatus(Enum):
@@ -2761,6 +2791,311 @@ class ParseError(CrawlerError):
     pass
 
 
+class DataStorage(ABC):
+    @abstractmethod
+    async def save(self, data: dict) -> None:
+        raise NotImplementedError()
+
+    async def flush(self) -> None:
+        return None
+
+    @abstractmethod
+    async def close(self) -> None:
+        raise NotImplementedError()
+
+    @abstractmethod
+    def get_stats(self) -> dict[str, object]:
+        raise NotImplementedError()
+
+
+class JSONStorage(DataStorage):
+    def __init__(
+        self,
+        file_path: str,
+        encoding: str = "utf-8",
+        pretty: bool = False,
+        buffer_size: int = 1,
+        retry_strategy: RetryStrategy | None = None,
+    ) -> None:
+        if not isinstance(file_path, str) or not file_path.strip():
+            raise InvalidOperationError("file_path must be a non-empty string")
+        if not isinstance(encoding, str) or not encoding.strip():
+            raise InvalidOperationError("encoding must be a non-empty string")
+        if not isinstance(pretty, bool):
+            raise InvalidOperationError("pretty must be a boolean")
+        if not isinstance(buffer_size, int) or buffer_size < 1:
+            raise InvalidOperationError("buffer_size must be a positive integer")
+        if retry_strategy is not None and not isinstance(retry_strategy, RetryStrategy):
+            raise InvalidOperationError("retry_strategy must be an instance of RetryStrategy")
+        self.file_path = Path(file_path).expanduser()
+        self.encoding = encoding.strip()
+        self.pretty = pretty
+        self.buffer_size = buffer_size
+        self.retry_strategy = retry_strategy if retry_strategy is not None else RetryStrategy(max_retries=1, base_delay=0.1)
+        self._buffer: list[dict[str, object]] = []
+        self._lock = asyncio.Lock()
+        self._stats = {"saved_count": 0, "flush_count": 0, "errors": 0, "path": str(self.file_path)}
+
+    def _serialize_line(self, record: dict[str, object]) -> str:
+        if self.pretty:
+            return json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n"
+        return json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n"
+
+    async def _write_lines(self, records: list[dict[str, object]]) -> None:
+        self.file_path.parent.mkdir(parents=True, exist_ok=True)
+        async with aiofiles.open(self.file_path, mode="a", encoding=self.encoding) as file:
+            for record in records:
+                await file.write(self._serialize_line(record))
+
+    async def save(self, data: dict) -> None:
+        record = normalize_crawl_record(data)
+        async with self._lock:
+            self._buffer.append(record)
+            if len(self._buffer) >= self.buffer_size:
+                await self._flush_locked()
+
+    async def _flush_locked(self) -> None:
+        if not self._buffer:
+            return
+        batch = list(self._buffer)
+        self._buffer.clear()
+        try:
+            await self.retry_strategy.execute_with_retry(self._write_lines, batch)
+            self._stats["saved_count"] += len(batch)
+            self._stats["flush_count"] += 1
+        except Exception:
+            self._stats["errors"] += 1
+            self._buffer[0:0] = batch
+            raise
+
+    async def flush(self) -> None:
+        async with self._lock:
+            await self._flush_locked()
+
+    async def close(self) -> None:
+        await self.flush()
+
+    def get_stats(self) -> dict[str, object]:
+        stats = dict(self._stats)
+        stats["buffered_count"] = len(self._buffer)
+        stats["retry"] = self.retry_strategy.get_stats()
+        return stats
+
+
+class CSVStorage(DataStorage):
+    def __init__(
+        self,
+        file_path: str,
+        encoding: str = "utf-8",
+        buffer_size: int = 1,
+        retry_strategy: RetryStrategy | None = None,
+    ) -> None:
+        if not isinstance(file_path, str) or not file_path.strip():
+            raise InvalidOperationError("file_path must be a non-empty string")
+        if not isinstance(encoding, str) or not encoding.strip():
+            raise InvalidOperationError("encoding must be a non-empty string")
+        if not isinstance(buffer_size, int) or buffer_size < 1:
+            raise InvalidOperationError("buffer_size must be a positive integer")
+        if retry_strategy is not None and not isinstance(retry_strategy, RetryStrategy):
+            raise InvalidOperationError("retry_strategy must be an instance of RetryStrategy")
+        self.file_path = Path(file_path).expanduser()
+        self.encoding = encoding.strip()
+        self.buffer_size = buffer_size
+        self.retry_strategy = retry_strategy if retry_strategy is not None else RetryStrategy(max_retries=1, base_delay=0.1)
+        self._buffer: list[dict[str, object]] = []
+        self._headers: list[str] | None = None
+        self._lock = asyncio.Lock()
+        self._stats = {"saved_count": 0, "flush_count": 0, "errors": 0, "path": str(self.file_path)}
+
+    @staticmethod
+    def _serialize_record(record: dict[str, object]) -> dict[str, object]:
+        return {
+            "url": record["url"],
+            "title": record["title"],
+            "text": record["text"],
+            "links": json.dumps(list(record["links"]), ensure_ascii=False),
+            "metadata": json.dumps(dict(record["metadata"]), ensure_ascii=False, sort_keys=True),
+            "crawled_at": record["crawled_at"],
+            "status_code": "" if record["status_code"] is None else str(record["status_code"]),
+            "content_type": record["content_type"],
+        }
+
+    async def _write_rows(self, rows: list[dict[str, object]], headers: list[str], write_header: bool) -> None:
+        self.file_path.parent.mkdir(parents=True, exist_ok=True)
+        buffer = io.StringIO()
+        writer = csv.DictWriter(buffer, fieldnames=headers, extrasaction="ignore", quoting=csv.QUOTE_MINIMAL)
+        if write_header:
+            writer.writeheader()
+        writer.writerows(rows)
+        async with aiofiles.open(self.file_path, mode="a", encoding=self.encoding, newline="") as file:
+            await file.write(buffer.getvalue())
+
+    async def save(self, data: dict) -> None:
+        record = self._serialize_record(normalize_crawl_record(data))
+        async with self._lock:
+            if self._headers is None:
+                self._headers = list(record.keys())
+            self._buffer.append(record)
+            if len(self._buffer) >= self.buffer_size:
+                await self._flush_locked()
+
+    async def _flush_locked(self) -> None:
+        if not self._buffer:
+            return
+        batch = list(self._buffer)
+        self._buffer.clear()
+        write_header = not self.file_path.exists() or self.file_path.stat().st_size == 0
+        try:
+            await self.retry_strategy.execute_with_retry(self._write_rows, batch, list(self._headers or []), write_header)
+            self._stats["saved_count"] += len(batch)
+            self._stats["flush_count"] += 1
+        except Exception:
+            self._stats["errors"] += 1
+            self._buffer[0:0] = batch
+            raise
+
+    async def flush(self) -> None:
+        async with self._lock:
+            await self._flush_locked()
+
+    async def close(self) -> None:
+        await self.flush()
+
+    def get_stats(self) -> dict[str, object]:
+        stats = dict(self._stats)
+        stats["buffered_count"] = len(self._buffer)
+        stats["headers"] = list(self._headers or [])
+        stats["retry"] = self.retry_strategy.get_stats()
+        return stats
+
+
+class SQLiteStorage(DataStorage):
+    def __init__(
+        self,
+        db_path: str,
+        table_name: str = "pages",
+        batch_size: int = 20,
+        retry_strategy: RetryStrategy | None = None,
+    ) -> None:
+        if not isinstance(db_path, str) or not db_path.strip():
+            raise InvalidOperationError("db_path must be a non-empty string")
+        if not isinstance(table_name, str) or not table_name.strip():
+            raise InvalidOperationError("table_name must be a non-empty string")
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", table_name.strip()):
+            raise InvalidOperationError("table_name contains invalid characters")
+        if not isinstance(batch_size, int) or batch_size < 1:
+            raise InvalidOperationError("batch_size must be a positive integer")
+        if retry_strategy is not None and not isinstance(retry_strategy, RetryStrategy):
+            raise InvalidOperationError("retry_strategy must be an instance of RetryStrategy")
+        self.db_path = Path(db_path).expanduser()
+        self.table_name = table_name.strip()
+        self.batch_size = batch_size
+        self.retry_strategy = retry_strategy if retry_strategy is not None else RetryStrategy(max_retries=1, base_delay=0.1)
+        self._buffer: list[dict[str, object]] = []
+        self._connection: aiosqlite.Connection | None = None
+        self._lock = asyncio.Lock()
+        self._initialized = False
+        self._stats = {"saved_count": 0, "flush_count": 0, "errors": 0, "path": str(self.db_path)}
+
+    async def _init_db_unlocked(self) -> None:
+        if self._initialized:
+            return
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._connection = await aiosqlite.connect(self.db_path)
+        await self._connection.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {self.table_name} (
+                url TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                text TEXT NOT NULL,
+                links_json TEXT NOT NULL,
+                metadata_json TEXT NOT NULL,
+                crawled_at TEXT NOT NULL,
+                status_code INTEGER,
+                content_type TEXT NOT NULL
+            )
+            """
+        )
+        await self._connection.execute(
+            f"CREATE INDEX IF NOT EXISTS idx_{self.table_name}_crawled_at ON {self.table_name} (crawled_at)"
+        )
+        await self._connection.commit()
+        self._initialized = True
+
+    async def init_db(self) -> None:
+        async with self._lock:
+            await self._init_db_unlocked()
+
+    @staticmethod
+    def _to_row(record: dict[str, object]) -> tuple[object, ...]:
+        return (
+            record["url"],
+            record["title"],
+            record["text"],
+            json.dumps(list(record["links"]), ensure_ascii=False),
+            json.dumps(dict(record["metadata"]), ensure_ascii=False, sort_keys=True),
+            record["crawled_at"],
+            record["status_code"],
+            record["content_type"],
+        )
+
+    async def _insert_rows(self, rows: list[tuple[object, ...]]) -> None:
+        if not self._initialized:
+            await self._init_db_unlocked()
+        if self._connection is None:
+            raise RuntimeError("database is not initialized")
+        await self._connection.executemany(
+            f"""
+            INSERT OR REPLACE INTO {self.table_name}
+            (url, title, text, links_json, metadata_json, crawled_at, status_code, content_type)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            rows,
+        )
+        await self._connection.commit()
+
+    async def save(self, data: dict) -> None:
+        record = normalize_crawl_record(data)
+        async with self._lock:
+            self._buffer.append(record)
+            if len(self._buffer) >= self.batch_size:
+                await self._flush_locked()
+
+    async def _flush_locked(self) -> None:
+        if not self._buffer:
+            return
+        batch = list(self._buffer)
+        self._buffer.clear()
+        rows = [self._to_row(record) for record in batch]
+        try:
+            await self.retry_strategy.execute_with_retry(self._insert_rows, rows)
+            self._stats["saved_count"] += len(batch)
+            self._stats["flush_count"] += 1
+        except Exception:
+            self._stats["errors"] += 1
+            self._buffer[0:0] = batch
+            raise
+
+    async def flush(self) -> None:
+        async with self._lock:
+            await self._flush_locked()
+
+    async def close(self) -> None:
+        await self.flush()
+        async with self._lock:
+            if self._connection is not None:
+                await self._connection.close()
+                self._connection = None
+            self._initialized = False
+
+    def get_stats(self) -> dict[str, object]:
+        stats = dict(self._stats)
+        stats["buffered_count"] = len(self._buffer)
+        stats["table_name"] = self.table_name
+        stats["retry"] = self.retry_strategy.get_stats()
+        return stats
+
+
 class RetryStrategy:
     def __init__(
         self,
@@ -2953,6 +3288,7 @@ class AsyncCrawler:
         backoff_factor: float = 2.0,
         backoff_max: float = 30.0,
         retry_strategy: RetryStrategy | None = None,
+        storage: DataStorage | None = None,
     ) -> None:
         if not isinstance(max_concurrent, int) or max_concurrent < 1:
             raise InvalidOperationError("max_concurrent must be a positive integer")
@@ -2985,6 +3321,8 @@ class AsyncCrawler:
             raise InvalidOperationError("backoff_max must be a non-negative number")
         if retry_strategy is not None and not isinstance(retry_strategy, RetryStrategy):
             raise InvalidOperationError("retry_strategy must be an instance of RetryStrategy")
+        if storage is not None and not isinstance(storage, DataStorage):
+            raise InvalidOperationError("storage must be an instance of DataStorage")
         self.max_concurrent = max_concurrent
         self.max_depth = max_depth
         self.per_domain_concurrent = per_domain_concurrent
@@ -3012,12 +3350,15 @@ class AsyncCrawler:
         self.rate_limiter = RateLimiter(requests_per_second=self.requests_per_second, per_domain=self.rate_limit_per_domain)
         self.robots_parser = RobotsParser(timeout=connect_timeout, user_agent=self.user_agent)
         self.retry_strategy = retry_strategy if retry_strategy is not None else RetryStrategy()
+        self.storage = storage
         self.visited_urls: set[str] = set()
         self.failed_urls: dict[str, str] = {}
         self.processed_urls: dict[str, dict[str, object]] = {}
         self.url_depths: dict[str, int] = {}
         self.blocked_urls: dict[str, str] = {}
         self.error_details: dict[str, dict[str, object]] = {}
+        self.storage_errors: dict[str, str] = {}
+        self._response_metadata: dict[str, dict[str, object]] = {}
         self._crawl_started_at = 0.0
         self._request_delay_total = 0.0
         self._request_delay_count = 0
@@ -3083,6 +3424,8 @@ class AsyncCrawler:
         self.url_depths.clear()
         self.blocked_urls.clear()
         self.error_details.clear()
+        self.storage_errors.clear()
+        self._response_metadata.clear()
         self.retry_strategy.reset_stats()
         self._crawl_started_at = perf_counter()
         self._request_delay_total = 0.0
@@ -3118,6 +3461,8 @@ class AsyncCrawler:
         stats["rate_limiter"] = self.rate_limiter.get_stats()
         stats["robots"] = self.robots_parser.get_stats()
         stats["retry"] = self.retry_strategy.get_stats()
+        stats["storage_errors"] = len(self.storage_errors)
+        stats["storage"] = self.storage.get_stats() if self.storage is not None else {}
         return stats
 
     def _log_crawl_progress(self, queue: CrawlerQueue) -> None:
@@ -3175,6 +3520,31 @@ class AsyncCrawler:
         if domain:
             self._domain_backoffs[domain] = 0.0
 
+    def _build_storage_record(self, url: str, parsed_result: dict[str, object]) -> dict[str, object]:
+        response_metadata = dict(self._response_metadata.get(url, {}))
+        return normalize_crawl_record(
+            {
+                "url": url,
+                "title": parsed_result.get("title", ""),
+                "text": parsed_result.get("text", ""),
+                "links": list(parsed_result.get("links", [])),
+                "metadata": dict(parsed_result.get("metadata", {})),
+                "crawled_at": _utc_now(),
+                "status_code": response_metadata.get("status_code"),
+                "content_type": response_metadata.get("content_type", ""),
+            }
+        )
+
+    async def _save_processed_page(self, url: str, parsed_result: dict[str, object]) -> None:
+        if self.storage is None:
+            return
+        record = self._build_storage_record(url, parsed_result)
+        try:
+            await self.storage.save(record)
+        except Exception as error:
+            self.storage_errors[url] = str(error)
+            logger.warning("Storage error for %s: %s", url, error)
+
     def _get_attempt_timeout(self, attempt_number: int) -> aiohttp.ClientTimeout:
         multiplier = self.retry_strategy.get_timeout_multiplier(attempt_number)
         return aiohttp.ClientTimeout(
@@ -3231,6 +3601,10 @@ class AsyncCrawler:
                     timeout=self._get_attempt_timeout(_retry_attempt),
                 ) as response:
                     response.raise_for_status()
+                    self._response_metadata[url] = {
+                        "status_code": response.status,
+                        "content_type": response.headers.get("Content-Type", ""),
+                    }
                     content = await response.text()
                     self._reset_backoff(domain)
                     logger.info("Completed download on attempt %s: %s", _retry_attempt, url)
@@ -3283,7 +3657,9 @@ class AsyncCrawler:
         if not html:
             return self.html_parser.empty_result(url)
         try:
-            return await self.html_parser.parse_html(html, url)
+            parsed_result = await self.html_parser.parse_html(html, url)
+            await self._save_processed_page(url, parsed_result)
+            return parsed_result
         except Exception as error:
             parse_error = self.retry_strategy.record_error(ParseError(str(error), url=url, original_error=error), url=url)
             self.error_details[url] = {
@@ -3364,6 +3740,7 @@ class AsyncCrawler:
             return
         parsed_result["depth"] = depth
         self.processed_urls[url] = parsed_result
+        await self._save_processed_page(url, parsed_result)
         queue.mark_processed(url)
 
         if depth < self.max_depth:
@@ -3464,6 +3841,7 @@ class AsyncCrawler:
             "failed_urls": dict(self.failed_urls),
             "blocked_urls": dict(self.blocked_urls),
             "error_details": dict(self.error_details),
+            "storage_errors": dict(self.storage_errors),
             "visited_urls": sorted(self.visited_urls),
             "stats": self._get_crawl_stats(queue),
         }
@@ -3472,6 +3850,11 @@ class AsyncCrawler:
         if self._session is not None and not self._session.closed:
             await self._session.close()
         self._session = None
+        if self.storage is not None:
+            try:
+                await self.storage.close()
+            except Exception as error:
+                logger.warning("Storage close error: %s", error)
 
     async def __aenter__(self) -> AsyncCrawler:
         await self._ensure_session()
