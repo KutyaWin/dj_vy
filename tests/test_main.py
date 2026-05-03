@@ -1,4 +1,5 @@
 
+import argparse
 import asyncio
 import aiohttp
 from bs4 import BeautifulSoup
@@ -16,16 +17,20 @@ from unittest.mock import patch
 
 from aiohttp import web
 
+import src.models as models_module
 from src.models import (
     AccountClosedError,
     AccountFrozenError,
     AccountStatus,
+    AdvancedCrawler,
     AsyncCrawler,
     BankAccount,
     Bank,
     Client,
     ClientStatus,
+    CrawlerConfig,
     CrawlerQueue,
+    CrawlerStats,
     Currency,
     InvestmentAccount,
     JSONStorage,
@@ -43,6 +48,7 @@ from src.models import (
     RetryStrategy,
     RobotsParser,
     SavingsAccount,
+    SitemapParser,
     SQLiteStorage,
     SemaphoreManager,
     TransientError,
@@ -53,7 +59,7 @@ from src.models import (
     TransactionType,
     CSVStorage,
 )
-from src.main import build_demo_bank, fetch_urls_sequentially, generate_report_artifacts, run_async_crawler_demo, run_html_parser_demo, run_polite_crawl_demo, run_retry_demo, run_site_crawl_demo, run_storage_demo
+from src.main import build_demo_bank, fetch_urls_sequentially, generate_report_artifacts, run_advanced_crawler_demo, run_async_crawler_demo, run_html_parser_demo, run_polite_crawl_demo, run_retry_demo, run_site_crawl_demo, run_storage_demo
 
 
 class BankAccountTestCase(unittest.TestCase):
@@ -1605,6 +1611,170 @@ class RetryStrategyTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(dict(strategy.get_stats()["error_counts_by_type"])["ParseError"], 1)
 
 
+class SitemapParserTestCase(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self) -> None:
+        app = web.Application()
+        app.router.add_get("/sitemap.xml", self.handle_sitemap_index)
+        app.router.add_get("/posts.xml", self.handle_posts_sitemap)
+        app.router.add_get("/docs.xml", self.handle_docs_sitemap)
+        self.runner = web.AppRunner(app)
+        await self.runner.setup()
+        self.site = web.TCPSite(self.runner, "127.0.0.1", 0)
+        await self.site.start()
+        self.port = self.site._server.sockets[0].getsockname()[1]
+        self.base_url = f"http://127.0.0.1:{self.port}"
+
+    async def asyncTearDown(self) -> None:
+        await self.runner.cleanup()
+
+    async def handle_sitemap_index(self, request: web.Request) -> web.Response:
+        return web.Response(
+            text=(
+                "<?xml version='1.0' encoding='UTF-8'?>"
+                "<sitemapindex xmlns='http://www.sitemaps.org/schemas/sitemap/0.9'>"
+                f"<sitemap><loc>{self.base_url}/posts.xml</loc></sitemap>"
+                f"<sitemap><loc>{self.base_url}/docs.xml</loc></sitemap>"
+                "</sitemapindex>"
+            ),
+            content_type="application/xml",
+        )
+
+    async def handle_posts_sitemap(self, request: web.Request) -> web.Response:
+        return web.Response(
+            text=(
+                "<?xml version='1.0' encoding='UTF-8'?>"
+                "<urlset xmlns='http://www.sitemaps.org/schemas/sitemap/0.9'>"
+                f"<url><loc>{self.base_url}/crawl/root</loc></url>"
+                f"<url><loc>{self.base_url}/crawl/page-1</loc></url>"
+                "</urlset>"
+            ),
+            content_type="application/xml",
+        )
+
+    async def handle_docs_sitemap(self, request: web.Request) -> web.Response:
+        return web.Response(
+            text=(
+                "<?xml version='1.0' encoding='UTF-8'?>"
+                "<urlset xmlns='http://www.sitemaps.org/schemas/sitemap/0.9'>"
+                f"<url><loc>{self.base_url}/crawl/page-1</loc></url>"
+                f"<url><loc>{self.base_url}/crawl/page-2</loc></url>"
+                "</urlset>"
+            ),
+            content_type="application/xml",
+        )
+
+    async def test_fetch_sitemap_supports_index_and_deduplicates_urls(self) -> None:
+        parser = SitemapParser(timeout=2.0)
+
+        urls = await parser.fetch_sitemap(f"{self.base_url}/sitemap.xml")
+        stats = parser.get_stats()
+        await parser.close()
+
+        self.assertEqual(
+            urls,
+            [
+                f"{self.base_url}/crawl/root",
+                f"{self.base_url}/crawl/page-1",
+                f"{self.base_url}/crawl/page-2",
+            ],
+        )
+        self.assertEqual(int(stats["visited_sitemaps"]), 3)
+        self.assertEqual(int(stats["urls_discovered"]), 3)
+
+
+class CrawlerStatsTestCase(unittest.TestCase):
+    def test_stats_collect_and_export(self) -> None:
+        stats = CrawlerStats()
+        stats.start()
+        stats.record_success("https://example.com/page", status_code=200)
+        stats.record_failure("https://example.com/missing", "PermanentError", status_code=404)
+        stats.ingest_runtime_snapshot({"pending": 2, "processed_pages": 1})
+        stats.finish()
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            json_path = Path(tmp_dir) / "stats.json"
+            html_path = Path(tmp_dir) / "report.html"
+            stats.export_to_json(str(json_path))
+            stats.export_to_html_report(str(html_path))
+
+            payload = json.loads(json_path.read_text(encoding="utf-8"))
+            html = html_path.read_text(encoding="utf-8")
+
+        self.assertEqual(payload["total_pages"], 2)
+        self.assertEqual(payload["successful"], 1)
+        self.assertEqual(payload["failed"], 1)
+        self.assertEqual(dict(payload["status_codes"])["200"], 1)
+        self.assertIn("Advanced Crawler Report", html)
+
+
+class CrawlerConfigTestCase(unittest.TestCase):
+    def test_config_from_dict_supports_sections(self) -> None:
+        config = CrawlerConfig.from_dict(
+            {
+                "inputs": {"start_urls": ["https://example.com"], "sitemap_urls": ["https://example.com/sitemap.xml"]},
+                "crawler": {"max_pages": 25, "max_depth": 3, "rate_limit": 2.5},
+                "storage": {"storage_type": "json", "storage_path": "/tmp/results.jsonl"},
+                "logging": {"log_level": "DEBUG"},
+            }
+        )
+
+        self.assertEqual(config.start_urls, ["https://example.com"])
+        self.assertEqual(config.sitemap_urls, ["https://example.com/sitemap.xml"])
+        self.assertEqual(config.max_pages, 25)
+        self.assertEqual(config.requests_per_second, 2.5)
+        self.assertEqual(config.storage_type, "json")
+        self.assertEqual(config.log_level, "DEBUG")
+
+    def test_config_from_file_reads_json(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_path = Path(tmp_dir) / "crawler.json"
+            config_path.write_text(
+                json.dumps({"start_urls": ["https://example.com"], "max_pages": 10}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+
+            config = CrawlerConfig.from_file(str(config_path))
+
+        self.assertEqual(config.start_urls, ["https://example.com"])
+        self.assertEqual(config.max_pages, 10)
+
+    def test_config_from_file_reads_yaml_when_available(self) -> None:
+        if models_module.yaml is None:
+            self.skipTest("PyYAML is not installed")
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_path = Path(tmp_dir) / "crawler.yaml"
+            config_path.write_text("start_urls:\n  - https://example.com\nmax_pages: 7\n", encoding="utf-8")
+
+            config = CrawlerConfig.from_file(str(config_path))
+
+        self.assertEqual(config.start_urls, ["https://example.com"])
+        self.assertEqual(config.max_pages, 7)
+
+    def test_config_from_cli_args_overrides_file_values(self) -> None:
+        namespace = argparse.Namespace(
+            config=None,
+            urls=["https://example.com"],
+            sitemap=None,
+            max_pages=15,
+            max_depth=2,
+            output="/tmp/out.json",
+            html_report="/tmp/report.html",
+            respect_robots=True,
+            rate_limit=3.5,
+            storage_type="sqlite",
+            storage_path="/tmp/crawler.db",
+            log_file="/tmp/crawler.log",
+            log_level="WARNING",
+        )
+
+        config = models_module.config_from_cli_args(namespace)
+
+        self.assertEqual(config.start_urls, ["https://example.com"])
+        self.assertEqual(config.max_pages, 15)
+        self.assertEqual(config.storage_type, "sqlite")
+        self.assertEqual(config.log_level, "WARNING")
+
+
 class StorageTestCase(unittest.IsolatedAsyncioTestCase):
     async def test_json_storage_writes_jsonl_records(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -2319,6 +2489,92 @@ class AsyncCrawlerTestCase(unittest.IsolatedAsyncioTestCase):
             self.assertGreaterEqual(len(dict(result["storage_errors"])), 1)
             self.assertGreaterEqual(int(dict(result["stats"])["storage_errors"]), 1)
 
+
+class AdvancedCrawlerTestCase(unittest.IsolatedAsyncioTestCase):
+    async def test_advanced_crawler_uses_sitemap_and_exports_reports(self) -> None:
+        class FakeSitemapParser:
+            def __init__(self) -> None:
+                self.closed = False
+
+            async def fetch_sitemap(self, sitemap_url: str) -> list[str]:
+                return ["https://example.com/from-sitemap"]
+
+            def get_stats(self) -> dict[str, object]:
+                return {"sitemaps_fetched": 1, "urls_discovered": 1, "errors": 0, "visited_sitemaps": 1}
+
+            async def close(self) -> None:
+                self.closed = True
+
+        original_crawl = AsyncCrawler.crawl
+
+        async def fake_crawl(self, start_urls: list[str], max_pages: int = 100, same_domain_only: bool = False, include_patterns=None, exclude_patterns=None, max_depth=None) -> dict[str, object]:
+            self._response_metadata = {start_urls[0]: {"status_code": 200, "content_type": "text/html"}}
+            return {
+                "processed_urls": {start_urls[0]: {"url": start_urls[0], "title": "From sitemap", "text": "body", "links": [], "metadata": {}, "images": [], "headings": [], "tables": [], "lists": [], "depth": 0}},
+                "failed_urls": {},
+                "blocked_urls": {},
+                "error_details": {},
+                "storage_errors": {},
+                "visited_urls": start_urls,
+                "stats": {"processed_pages": 1, "failed_pages": 0, "pending": 0},
+            }
+
+        AsyncCrawler.crawl = fake_crawl
+        try:
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                config = CrawlerConfig(
+                    sitemap_urls=["https://example.com/sitemap.xml"],
+                    output_json=str(Path(tmp_dir) / "advanced.json"),
+                    output_html=str(Path(tmp_dir) / "advanced.html"),
+                    progress_interval=0.0,
+                )
+                advanced = AdvancedCrawler(config, sitemap_parser=FakeSitemapParser())
+                result = await advanced.crawl()
+                stats = advanced.get_stats()
+                await advanced.close()
+
+                self.assertEqual(list(result["processed_urls"].keys()), ["https://example.com/from-sitemap"])
+                self.assertTrue(Path(config.output_json).exists())
+                self.assertTrue(Path(config.output_html).exists())
+                self.assertEqual(dict(stats["sitemap"])["urls_discovered"], 1)
+                self.assertEqual(dict(stats)["successful"], 1)
+        finally:
+            AsyncCrawler.crawl = original_crawl
+
+    async def test_run_advanced_crawler_with_config_returns_stats(self) -> None:
+        original_crawl = AdvancedCrawler.crawl
+        original_get_stats = AdvancedCrawler.get_stats
+
+        async def fake_crawl(self) -> dict[str, object]:
+            self._crawl_result = {"processed_urls": {"https://example.com": {}}, "stats": {"processed_pages": 1}}
+            return dict(self._crawl_result)
+
+        def fake_get_stats(self) -> dict[str, object]:
+            return {"total_pages": 1, "successful": 1, "failed": 0}
+
+        AdvancedCrawler.crawl = fake_crawl
+        AdvancedCrawler.get_stats = fake_get_stats
+        try:
+            result = await models_module.run_advanced_crawler_with_config(CrawlerConfig(start_urls=["https://example.com"], progress_interval=0.0))
+        finally:
+            AdvancedCrawler.crawl = original_crawl
+            AdvancedCrawler.get_stats = original_get_stats
+
+        self.assertEqual(dict(result)["successful"], 1)
+
+
+class AdvancedCrawlerCLITestCase(unittest.IsolatedAsyncioTestCase):
+    def test_cli_runner_builds_config_and_returns_zero(self) -> None:
+        async def fake_run(config: CrawlerConfig) -> dict[str, object]:
+            self.assertEqual(config.start_urls, ["https://example.com"])
+            self.assertEqual(config.max_pages, 3)
+            return {"successful": 1}
+
+        with patch("src.models.run_advanced_crawler_with_config", new=fake_run):
+            exit_code = models_module.run_advanced_crawler_cli(["--urls", "https://example.com", "--max-pages", "3"])
+
+        self.assertEqual(exit_code, 0)
+
     async def test_run_async_crawler_demo_returns_expected_shape(self) -> None:
         original_fetch_urls = AsyncCrawler.fetch_urls
         original_fetch_url = AsyncCrawler.fetch_url
@@ -2495,6 +2751,36 @@ class AsyncCrawlerTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(int(result["json_records"]), 1)
         self.assertGreaterEqual(int(result["csv_records"]), 1)
         self.assertGreaterEqual(int(result["sqlite_rows"]), 1)
+
+    async def test_run_advanced_crawler_demo_returns_artifacts(self) -> None:
+        original_crawl = AdvancedCrawler.crawl
+        original_get_stats = AdvancedCrawler.get_stats
+
+        async def fake_crawl(self) -> dict[str, object]:
+            if self.config.output_json:
+                Path(str(self.config.output_json)).write_text(json.dumps({"ok": True}), encoding="utf-8")
+            if self.config.output_html:
+                Path(str(self.config.output_html)).write_text("<html></html>", encoding="utf-8")
+            if self.config.storage_path:
+                Path(str(self.config.storage_path)).write_text('{"url":"https://example.com"}\n', encoding="utf-8")
+            self._crawl_result = {"processed_urls": {"https://example.com": {}}, "stats": {"processed_pages": 1}}
+            return dict(self._crawl_result)
+
+        def fake_get_stats(self) -> dict[str, object]:
+            return {"total_pages": 1, "successful": 1, "failed": 0}
+
+        AdvancedCrawler.crawl = fake_crawl
+        AdvancedCrawler.get_stats = fake_get_stats
+        try:
+            result = await run_advanced_crawler_demo()
+        finally:
+            AdvancedCrawler.crawl = original_crawl
+            AdvancedCrawler.get_stats = original_get_stats
+
+        self.assertTrue(Path(str(result["output_json"])).exists())
+        self.assertTrue(Path(str(result["output_html"])).exists())
+        self.assertTrue(Path(str(result["storage_path"])).exists())
+        self.assertEqual(dict(result["stats"])["successful"], 1)
 
 
 if __name__ == "__main__":

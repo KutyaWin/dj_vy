@@ -11,10 +11,12 @@ from typing import Callable
 try:
     from .models import (
         AbstractAccount,
+        AdvancedCrawler,
         AsyncCrawler,
         Bank,
         CSVStorage,
         Client,
+        CrawlerConfig,
         HTMLParser,
         InvalidOperationError,
         JSONStorage,
@@ -30,10 +32,12 @@ try:
 except ImportError:
     from models import (
         AbstractAccount,
+        AdvancedCrawler,
         AsyncCrawler,
         Bank,
         CSVStorage,
         Client,
+        CrawlerConfig,
         HTMLParser,
         InvalidOperationError,
         JSONStorage,
@@ -952,6 +956,36 @@ def print_storage_demo_summary(result: dict[str, object]) -> None:
     print(f"JSON records: {result['json_records']}")
     print(f"CSV records: {result['csv_records']}")
     print(f"SQLite rows: {result['sqlite_rows']}")
+
+
+async def run_advanced_crawler_demo() -> dict[str, object]:
+    output_dir = Path(tempfile.gettempdir()) / "dj_vy_advanced_demo"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    config = CrawlerConfig(
+        start_urls=["https://example.com"],
+        max_pages=5,
+        max_depth=1,
+        same_domain_only=True,
+        requests_per_second=2.0,
+        respect_robots=True,
+        storage_type="json",
+        storage_path=str(output_dir / "advanced_results.jsonl"),
+        output_json=str(output_dir / "advanced_stats.json"),
+        output_html=str(output_dir / "advanced_report.html"),
+        progress_interval=0.0,
+    )
+    crawler = AdvancedCrawler(config)
+    try:
+        result = await crawler.crawl()
+        return {
+            "result": result,
+            "stats": crawler.get_stats(),
+            "output_json": config.output_json,
+            "output_html": config.output_html,
+            "storage_path": config.storage_path,
+        }
+    finally:
+        await crawler.close()
 
 
 def main() -> None:

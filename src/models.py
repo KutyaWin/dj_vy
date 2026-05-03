@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import argparse
 import asyncio
 from abc import ABC, abstractmethod
-from collections import deque
+from collections import Counter, deque
 from contextlib import asynccontextmanager
 import csv
 from dataclasses import dataclass, field
@@ -10,21 +11,29 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from enum import Enum
 import heapq
+from html import escape
 import inspect
 import io
 import json
 import logging
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 import random
 import re
 from time import perf_counter
 from urllib.parse import urldefrag, urljoin, urlparse
 from uuid import uuid4
+import xml.etree.ElementTree as ET
 
 import aiohttp
 import aiofiles
 import aiosqlite
 from bs4 import BeautifulSoup
+
+try:
+    import yaml
+except ImportError:
+    yaml = None
 
 
 TWOPLACES = Decimal("0.01")
@@ -3862,3 +3871,644 @@ class AsyncCrawler:
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
         await self.close()
+
+
+class SitemapParser:
+    def __init__(self, timeout: float = 10.0, user_agent: str = "AsyncCrawler/1.0") -> None:
+        if not isinstance(timeout, (int, float)) or timeout <= 0:
+            raise InvalidOperationError("timeout must be a positive number")
+        if not isinstance(user_agent, str) or not user_agent.strip():
+            raise InvalidOperationError("user_agent must be a non-empty string")
+        self.timeout = float(timeout)
+        self.user_agent = user_agent.strip()
+        self._session: aiohttp.ClientSession | None = None
+        self._visited_sitemaps: set[str] = set()
+        self._stats = {"sitemaps_fetched": 0, "urls_discovered": 0, "errors": 0}
+
+    async def _ensure_session(self) -> aiohttp.ClientSession:
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=self.timeout),
+                headers={"User-Agent": self.user_agent},
+            )
+        return self._session
+
+    @staticmethod
+    def _local_name(tag_name: str) -> str:
+        if "}" in tag_name:
+            return tag_name.rsplit("}", 1)[1]
+        return tag_name
+
+    def _parse_sitemap_xml(self, xml_text: str) -> tuple[list[str], list[str]]:
+        try:
+            root = ET.fromstring(xml_text)
+        except ET.ParseError as error:
+            raise ParseError("invalid sitemap xml", original_error=error) from error
+        root_name = self._local_name(root.tag)
+        urls: list[str] = []
+        nested_sitemaps: list[str] = []
+        if root_name == "sitemapindex":
+            for child in root:
+                if self._local_name(child.tag) != "sitemap":
+                    continue
+                for item in child:
+                    if self._local_name(item.tag) == "loc" and item.text:
+                        nested_sitemaps.append(item.text.strip())
+            return urls, nested_sitemaps
+        if root_name == "urlset":
+            for child in root:
+                if self._local_name(child.tag) != "url":
+                    continue
+                for item in child:
+                    if self._local_name(item.tag) == "loc" and item.text:
+                        urls.append(item.text.strip())
+            return urls, nested_sitemaps
+        raise ParseError(f"unsupported sitemap root: {root_name}")
+
+    async def _fetch_xml(self, sitemap_url: str) -> str:
+        session = await self._ensure_session()
+        async with session.get(sitemap_url) as response:
+            response.raise_for_status()
+            self._stats["sitemaps_fetched"] += 1
+            return await response.text()
+
+    async def fetch_sitemap(self, sitemap_url: str) -> list[str]:
+        if not isinstance(sitemap_url, str) or not sitemap_url.strip():
+            raise InvalidOperationError("sitemap_url must be a non-empty string")
+        normalized_url = sitemap_url.strip()
+        queue = deque([normalized_url])
+        urls: list[str] = []
+        seen_urls: set[str] = set()
+        while queue:
+            current_url = queue.popleft()
+            if current_url in self._visited_sitemaps:
+                continue
+            self._visited_sitemaps.add(current_url)
+            try:
+                xml_text = await self._fetch_xml(current_url)
+                page_urls, nested_sitemaps = self._parse_sitemap_xml(xml_text)
+            except Exception as error:
+                self._stats["errors"] += 1
+                logger.warning("Failed to fetch sitemap %s: %s", current_url, error)
+                continue
+            for page_url in page_urls:
+                if page_url not in seen_urls:
+                    seen_urls.add(page_url)
+                    urls.append(page_url)
+            for nested_url in nested_sitemaps:
+                if nested_url not in self._visited_sitemaps:
+                    queue.append(nested_url)
+        self._stats["urls_discovered"] += len(urls)
+        return urls
+
+    def get_stats(self) -> dict[str, object]:
+        stats = dict(self._stats)
+        stats["visited_sitemaps"] = len(self._visited_sitemaps)
+        return stats
+
+    async def close(self) -> None:
+        if self._session is not None and not self._session.closed:
+            await self._session.close()
+        self._session = None
+
+
+@dataclass
+class CrawlerStats:
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    total_pages: int = 0
+    successful: int = 0
+    failed: int = 0
+    status_codes: Counter = field(default_factory=Counter)
+    domain_counts: Counter = field(default_factory=Counter)
+    error_types: Counter = field(default_factory=Counter)
+    active_tasks: int = 0
+    latest_snapshot: dict[str, object] = field(default_factory=dict)
+
+    def start(self) -> None:
+        self.started_at = _utc_now()
+        self.finished_at = None
+
+    def finish(self) -> None:
+        self.finished_at = _utc_now()
+
+    def record_success(self, url: str, status_code: int | None = None) -> None:
+        self.total_pages += 1
+        self.successful += 1
+        if isinstance(status_code, int):
+            self.status_codes[str(status_code)] += 1
+        domain = urlparse(url).netloc
+        if domain:
+            self.domain_counts[domain] += 1
+
+    def record_failure(self, url: str, error_type: str, status_code: int | None = None) -> None:
+        self.total_pages += 1
+        self.failed += 1
+        self.error_types[error_type or "UnknownError"] += 1
+        if isinstance(status_code, int):
+            self.status_codes[str(status_code)] += 1
+        domain = urlparse(url).netloc
+        if domain:
+            self.domain_counts[domain] += 1
+
+    @property
+    def elapsed_seconds(self) -> float:
+        if self.started_at is None:
+            return 0.0
+        finished_at = self.finished_at or _utc_now()
+        return max(0.0, (finished_at - self.started_at).total_seconds())
+
+    @property
+    def pages_per_second(self) -> float:
+        elapsed = self.elapsed_seconds
+        return self.total_pages / elapsed if elapsed > 0 else 0.0
+
+    def ingest_runtime_snapshot(self, snapshot: dict[str, object]) -> None:
+        self.latest_snapshot = dict(snapshot)
+        self.active_tasks = int(snapshot.get("pending", 0))
+
+    def ingest_crawl_result(self, crawler: AsyncCrawler, result: dict[str, object]) -> None:
+        self.total_pages = 0
+        self.successful = 0
+        self.failed = 0
+        self.status_codes.clear()
+        self.domain_counts.clear()
+        self.error_types.clear()
+        response_metadata = dict(getattr(crawler, "_response_metadata", {}))
+        processed_urls = dict(result.get("processed_urls", {}))
+        for url in processed_urls:
+            metadata = dict(response_metadata.get(url, {}))
+            self.record_success(url, status_code=metadata.get("status_code") if isinstance(metadata.get("status_code"), int) else None)
+        failed_urls = dict(result.get("failed_urls", {}))
+        error_details = dict(result.get("error_details", {}))
+        for url in failed_urls:
+            error_detail = dict(error_details.get(url, {}))
+            status_code = None
+            message = str(error_detail.get("message", ""))
+            status_match = re.search(r"HTTP\s+(\d{3})", message)
+            if status_match:
+                status_code = int(status_match.group(1))
+            self.record_failure(url, str(error_detail.get("type", "UnknownError")), status_code=status_code)
+        self.ingest_runtime_snapshot(dict(result.get("stats", {})))
+
+    def snapshot(self) -> dict[str, object]:
+        return {
+            "total_pages": self.total_pages,
+            "successful": self.successful,
+            "failed": self.failed,
+            "elapsed_seconds": self.elapsed_seconds,
+            "pages_per_second": self.pages_per_second,
+            "status_codes": dict(self.status_codes),
+            "top_domains": dict(self.domain_counts.most_common(10)),
+            "error_types": dict(self.error_types),
+            "active_tasks": self.active_tasks,
+            "started_at": self.started_at.isoformat() if self.started_at is not None else None,
+            "finished_at": self.finished_at.isoformat() if self.finished_at is not None else None,
+            "latest_snapshot": dict(self.latest_snapshot),
+        }
+
+    def export_to_json(self, filename: str) -> None:
+        if not isinstance(filename, str) or not filename.strip():
+            raise InvalidOperationError("filename must be a non-empty string")
+        path = Path(filename).expanduser()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(self.snapshot(), ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def export_to_html_report(self, filename: str) -> None:
+        if not isinstance(filename, str) or not filename.strip():
+            raise InvalidOperationError("filename must be a non-empty string")
+        snapshot = self.snapshot()
+        path = Path(filename).expanduser()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        top_domains_rows = "".join(
+            f"<tr><td>{escape(domain)}</td><td>{count}</td></tr>"
+            for domain, count in dict(snapshot["top_domains"]).items()
+        ) or "<tr><td colspan='2'>No domain data</td></tr>"
+        status_rows = "".join(
+            f"<tr><td>{escape(code)}</td><td><div class='bar' style='width:{min(count * 24, 320)}px'></div><span>{count}</span></td></tr>"
+            for code, count in dict(snapshot["status_codes"]).items()
+        ) or "<tr><td colspan='2'>No status data</td></tr>"
+        html = f"""
+<!DOCTYPE html>
+<html lang=\"en\">
+<head>
+  <meta charset=\"utf-8\">
+  <title>Crawler Report</title>
+  <style>
+    body {{ font-family: Arial, sans-serif; margin: 24px; color: #1f2937; background: #f8fafc; }}
+    .grid {{ display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin-bottom: 24px; }}
+    .card {{ background: white; border-radius: 10px; padding: 16px; box-shadow: 0 2px 8px rgba(15, 23, 42, 0.08); }}
+    .card h3 {{ margin: 0 0 8px 0; font-size: 14px; color: #64748b; }}
+    .card p {{ margin: 0; font-size: 24px; font-weight: 700; }}
+    table {{ width: 100%; border-collapse: collapse; background: white; margin-bottom: 20px; }}
+    th, td {{ text-align: left; padding: 10px; border-bottom: 1px solid #e2e8f0; }}
+    th {{ background: #f1f5f9; }}
+    .bar {{ display: inline-block; height: 10px; background: #2563eb; border-radius: 999px; margin-right: 10px; vertical-align: middle; }}
+  </style>
+</head>
+<body>
+  <h1>Advanced Crawler Report</h1>
+  <div class=\"grid\">
+    <div class=\"card\"><h3>Total Pages</h3><p>{snapshot['total_pages']}</p></div>
+    <div class=\"card\"><h3>Successful</h3><p>{snapshot['successful']}</p></div>
+    <div class=\"card\"><h3>Failed</h3><p>{snapshot['failed']}</p></div>
+    <div class=\"card\"><h3>Pages/sec</h3><p>{snapshot['pages_per_second']:.2f}</p></div>
+  </div>
+  <h2>Status Codes</h2>
+  <table>
+    <thead><tr><th>Status</th><th>Count</th></tr></thead>
+    <tbody>{status_rows}</tbody>
+  </table>
+  <h2>Top Domains</h2>
+  <table>
+    <thead><tr><th>Domain</th><th>Pages</th></tr></thead>
+    <tbody>{top_domains_rows}</tbody>
+  </table>
+</body>
+</html>
+        """.strip()
+        path.write_text(html, encoding="utf-8")
+
+
+@dataclass
+class CrawlerConfig:
+    start_urls: list[str] = field(default_factory=list)
+    sitemap_urls: list[str] = field(default_factory=list)
+    max_pages: int = 100
+    max_depth: int = 2
+    same_domain_only: bool = True
+    max_concurrent: int = 10
+    per_domain_concurrent: int | None = None
+    requests_per_second: float = 1.0
+    respect_robots: bool = True
+    rate_limit_per_domain: bool = True
+    min_delay: float = 0.0
+    jitter: float = 0.0
+    include_patterns: list[str] = field(default_factory=list)
+    exclude_patterns: list[str] = field(default_factory=list)
+    connect_timeout: float = 5.0
+    read_timeout: float = 10.0
+    total_timeout: float = 15.0
+    user_agent: str = "AsyncCrawler/1.0"
+    user_agents: list[str] | None = None
+    backoff_base: float = 0.5
+    backoff_factor: float = 2.0
+    backoff_max: float = 30.0
+    storage_type: str | None = None
+    storage_path: str | None = None
+    storage_pretty: bool = False
+    storage_buffer_size: int = 1
+    output_json: str | None = None
+    output_html: str | None = None
+    log_file: str | None = None
+    log_level: str = "INFO"
+    log_max_bytes: int = 1_000_000
+    log_backup_count: int = 3
+    progress_interval: float = 1.0
+
+    @staticmethod
+    def _coerce_list(value: object) -> list[str]:
+        if value is None:
+            return []
+        if isinstance(value, str):
+            return [item.strip() for item in value.split(",") if item.strip()]
+        if isinstance(value, list):
+            return [str(item).strip() for item in value if str(item).strip()]
+        raise InvalidOperationError("expected a list of strings")
+
+    @classmethod
+    def from_dict(cls, data: dict[str, object]) -> CrawlerConfig:
+        if not isinstance(data, dict):
+            raise InvalidOperationError("config data must be a dictionary")
+        crawler_section = dict(data.get("crawler", {})) if isinstance(data.get("crawler"), dict) else {}
+        input_section = dict(data.get("inputs", {})) if isinstance(data.get("inputs"), dict) else {}
+        storage_section = dict(data.get("storage", {})) if isinstance(data.get("storage"), dict) else {}
+        logging_section = dict(data.get("logging", {})) if isinstance(data.get("logging"), dict) else {}
+
+        def pick(key: str, default: object = None) -> object:
+            for source in (data, crawler_section, input_section, storage_section, logging_section):
+                if key in source:
+                    return source[key]
+            return default
+
+        config = cls(
+            start_urls=cls._coerce_list(pick("start_urls", pick("urls", []))),
+            sitemap_urls=cls._coerce_list(pick("sitemap_urls", [])),
+            max_pages=int(pick("max_pages", 100)),
+            max_depth=int(pick("max_depth", 2)),
+            same_domain_only=bool(pick("same_domain_only", True)),
+            max_concurrent=int(pick("max_concurrent", 10)),
+            per_domain_concurrent=int(pick("per_domain_concurrent", pick("max_concurrent", 10))) if pick("per_domain_concurrent", None) is not None else None,
+            requests_per_second=float(pick("requests_per_second", pick("rate_limit", 1.0))),
+            respect_robots=bool(pick("respect_robots", True)),
+            rate_limit_per_domain=bool(pick("rate_limit_per_domain", True)),
+            min_delay=float(pick("min_delay", 0.0)),
+            jitter=float(pick("jitter", 0.0)),
+            include_patterns=cls._coerce_list(pick("include_patterns", [])),
+            exclude_patterns=cls._coerce_list(pick("exclude_patterns", [])),
+            connect_timeout=float(pick("connect_timeout", 5.0)),
+            read_timeout=float(pick("read_timeout", 10.0)),
+            total_timeout=float(pick("total_timeout", 15.0)),
+            user_agent=str(pick("user_agent", "AsyncCrawler/1.0")),
+            user_agents=cls._coerce_list(pick("user_agents", [])) or None,
+            backoff_base=float(pick("backoff_base", 0.5)),
+            backoff_factor=float(pick("backoff_factor", 2.0)),
+            backoff_max=float(pick("backoff_max", 30.0)),
+            storage_type=str(pick("storage_type", "")).strip() or None,
+            storage_path=str(pick("storage_path", "")).strip() or None,
+            storage_pretty=bool(pick("storage_pretty", False)),
+            storage_buffer_size=int(pick("storage_buffer_size", 1)),
+            output_json=str(pick("output_json", "")).strip() or None,
+            output_html=str(pick("output_html", "")).strip() or None,
+            log_file=str(pick("log_file", "")).strip() or None,
+            log_level=str(pick("log_level", "INFO")).upper(),
+            log_max_bytes=int(pick("log_max_bytes", 1_000_000)),
+            log_backup_count=int(pick("log_backup_count", 3)),
+            progress_interval=float(pick("progress_interval", 1.0)),
+        )
+        if not config.start_urls and not config.sitemap_urls:
+            raise InvalidOperationError("config must define start_urls or sitemap_urls")
+        return config
+
+    @classmethod
+    def from_file(cls, file_path: str) -> CrawlerConfig:
+        if not isinstance(file_path, str) or not file_path.strip():
+            raise InvalidOperationError("file_path must be a non-empty string")
+        path = Path(file_path).expanduser()
+        raw_text = path.read_text(encoding="utf-8")
+        suffix = path.suffix.lower()
+        if suffix == ".json":
+            payload = json.loads(raw_text)
+        elif suffix in {".yaml", ".yml"}:
+            if yaml is None:
+                raise InvalidOperationError("PyYAML is required to read YAML config files")
+            payload = yaml.safe_load(raw_text) or {}
+        else:
+            raise InvalidOperationError("config file must be JSON or YAML")
+        return cls.from_dict(payload)
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "start_urls": list(self.start_urls),
+            "sitemap_urls": list(self.sitemap_urls),
+            "max_pages": self.max_pages,
+            "max_depth": self.max_depth,
+            "same_domain_only": self.same_domain_only,
+            "max_concurrent": self.max_concurrent,
+            "per_domain_concurrent": self.per_domain_concurrent,
+            "requests_per_second": self.requests_per_second,
+            "respect_robots": self.respect_robots,
+            "rate_limit_per_domain": self.rate_limit_per_domain,
+            "min_delay": self.min_delay,
+            "jitter": self.jitter,
+            "include_patterns": list(self.include_patterns),
+            "exclude_patterns": list(self.exclude_patterns),
+            "connect_timeout": self.connect_timeout,
+            "read_timeout": self.read_timeout,
+            "total_timeout": self.total_timeout,
+            "user_agent": self.user_agent,
+            "user_agents": list(self.user_agents) if self.user_agents is not None else None,
+            "backoff_base": self.backoff_base,
+            "backoff_factor": self.backoff_factor,
+            "backoff_max": self.backoff_max,
+            "storage_type": self.storage_type,
+            "storage_path": self.storage_path,
+            "storage_pretty": self.storage_pretty,
+            "storage_buffer_size": self.storage_buffer_size,
+            "output_json": self.output_json,
+            "output_html": self.output_html,
+            "log_file": self.log_file,
+            "log_level": self.log_level,
+            "log_max_bytes": self.log_max_bytes,
+            "log_backup_count": self.log_backup_count,
+            "progress_interval": self.progress_interval,
+        }
+
+
+class AdvancedCrawler:
+    def __init__(
+        self,
+        config: CrawlerConfig,
+        crawler: AsyncCrawler | None = None,
+        sitemap_parser: SitemapParser | None = None,
+        stats: CrawlerStats | None = None,
+    ) -> None:
+        if not isinstance(config, CrawlerConfig):
+            raise InvalidOperationError("config must be an instance of CrawlerConfig")
+        self.config = config
+        self.app_logger = logging.getLogger("src.models.advanced_crawler")
+        self._configure_logging()
+        self.sitemap_parser = sitemap_parser if sitemap_parser is not None else SitemapParser(timeout=config.connect_timeout, user_agent=config.user_agent)
+        self.stats = stats if stats is not None else CrawlerStats()
+        self.storage = self._build_storage()
+        self.crawler = crawler if crawler is not None else AsyncCrawler(
+            max_concurrent=config.max_concurrent,
+            connect_timeout=config.connect_timeout,
+            read_timeout=config.read_timeout,
+            total_timeout=config.total_timeout,
+            max_depth=config.max_depth,
+            per_domain_concurrent=config.per_domain_concurrent,
+            requests_per_second=config.requests_per_second,
+            rate_limit_per_domain=config.rate_limit_per_domain,
+            respect_robots=config.respect_robots,
+            min_delay=config.min_delay,
+            jitter=config.jitter,
+            user_agent=config.user_agent,
+            user_agents=config.user_agents,
+            backoff_base=config.backoff_base,
+            backoff_factor=config.backoff_factor,
+            backoff_max=config.backoff_max,
+            storage=self.storage,
+        )
+        self._crawl_result: dict[str, object] = {}
+        self._monitor_task: asyncio.Task | None = None
+
+    @classmethod
+    def from_config(cls, file_path: str) -> AdvancedCrawler:
+        return cls(CrawlerConfig.from_file(file_path))
+
+    def _configure_logging(self) -> None:
+        level = getattr(logging, self.config.log_level.upper(), logging.INFO)
+        formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+        self.app_logger.setLevel(level)
+        self.app_logger.propagate = False
+        if not any(isinstance(handler, logging.StreamHandler) and getattr(handler, "_advanced_console", False) for handler in self.app_logger.handlers):
+            console_handler = logging.StreamHandler()
+            console_handler.setFormatter(formatter)
+            console_handler.setLevel(level)
+            console_handler._advanced_console = True
+            self.app_logger.addHandler(console_handler)
+        if self.config.log_file and not any(isinstance(handler, RotatingFileHandler) and getattr(handler, "baseFilename", "") == str(Path(self.config.log_file).expanduser()) for handler in self.app_logger.handlers):
+            log_path = Path(self.config.log_file).expanduser()
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            file_handler = RotatingFileHandler(log_path, maxBytes=self.config.log_max_bytes, backupCount=self.config.log_backup_count, encoding="utf-8")
+            file_handler.setFormatter(formatter)
+            file_handler.setLevel(level)
+            self.app_logger.addHandler(file_handler)
+
+    def _build_storage(self) -> DataStorage | None:
+        storage_type = (self.config.storage_type or "").strip().lower()
+        if not storage_type or not self.config.storage_path:
+            return None
+        if storage_type == "json":
+            return JSONStorage(self.config.storage_path, pretty=self.config.storage_pretty, buffer_size=self.config.storage_buffer_size)
+        if storage_type == "csv":
+            return CSVStorage(self.config.storage_path, buffer_size=self.config.storage_buffer_size)
+        if storage_type == "sqlite":
+            return SQLiteStorage(self.config.storage_path, batch_size=max(1, self.config.storage_buffer_size))
+        raise InvalidOperationError(f"unsupported storage_type: {self.config.storage_type}")
+
+    async def _resolve_start_urls(self) -> list[str]:
+        urls: list[str] = []
+        seen: set[str] = set()
+        for candidate in list(self.config.start_urls):
+            normalized = AsyncCrawler._normalize_crawl_url(candidate)
+            if normalized and normalized not in seen:
+                seen.add(normalized)
+                urls.append(normalized)
+        for sitemap_url in list(self.config.sitemap_urls):
+            discovered_urls = await self.sitemap_parser.fetch_sitemap(sitemap_url)
+            for candidate in discovered_urls:
+                normalized = AsyncCrawler._normalize_crawl_url(candidate)
+                if normalized and normalized not in seen:
+                    seen.add(normalized)
+                    urls.append(normalized)
+        return urls
+
+    async def _monitor_progress(self) -> None:
+        interval = max(0.2, self.config.progress_interval)
+        while True:
+            await asyncio.sleep(interval)
+            if self.stats.started_at is None:
+                continue
+            processed = len(self.crawler.processed_urls)
+            failed = len(self.crawler.failed_urls)
+            completed = processed + failed
+            speed = completed / max(self.stats.elapsed_seconds, 0.001)
+            remaining = max(0, self.config.max_pages - completed)
+            eta = remaining / speed if speed > 0 else 0.0
+            percent = min(100.0, (completed / self.config.max_pages) * 100) if self.config.max_pages > 0 else 0.0
+            self.app_logger.info(
+                "Progress %.1f%% | processed=%s failed=%s speed=%.2f pages/sec eta=%.1fs active=%s",
+                percent,
+                processed,
+                failed,
+                speed,
+                eta,
+                len(self.crawler._request_started_at),
+            )
+
+    async def crawl(self) -> dict[str, object]:
+        self.stats.start()
+        self._crawl_result = {}
+        start_urls = await self._resolve_start_urls()
+        if not start_urls:
+            raise InvalidOperationError("no crawlable URLs resolved from start_urls/sitemaps")
+        self.app_logger.info("Starting advanced crawl with %s urls", len(start_urls))
+        if self.config.progress_interval > 0:
+            self._monitor_task = asyncio.create_task(self._monitor_progress())
+        try:
+            self._crawl_result = await self.crawler.crawl(
+                start_urls=start_urls,
+                max_pages=self.config.max_pages,
+                same_domain_only=self.config.same_domain_only,
+                include_patterns=list(self.config.include_patterns) or None,
+                exclude_patterns=list(self.config.exclude_patterns) or None,
+            )
+        finally:
+            if self._monitor_task is not None:
+                self._monitor_task.cancel()
+                await asyncio.gather(self._monitor_task, return_exceptions=True)
+                self._monitor_task = None
+            self.stats.finish()
+        self.stats.ingest_crawl_result(self.crawler, self._crawl_result)
+        if self.config.output_json:
+            self.export_to_json(self.config.output_json)
+        if self.config.output_html:
+            self.export_to_html_report(self.config.output_html)
+        return dict(self._crawl_result)
+
+    def get_stats(self) -> dict[str, object]:
+        snapshot = self.stats.snapshot()
+        snapshot["sitemap"] = self.sitemap_parser.get_stats()
+        snapshot["config"] = self.config.to_dict()
+        snapshot["crawl_stats"] = dict(self._crawl_result.get("stats", {})) if self._crawl_result else {}
+        return snapshot
+
+    def export_to_json(self, filename: str) -> None:
+        payload = self.get_stats()
+        path = Path(filename).expanduser()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def export_to_html_report(self, filename: str) -> None:
+        self.stats.export_to_html_report(filename)
+
+    async def close(self) -> None:
+        await self.crawler.close()
+        await self.sitemap_parser.close()
+
+
+def build_advanced_crawler_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Advanced asynchronous crawler")
+    parser.add_argument("--urls", nargs="*", default=None, help="Start URLs")
+    parser.add_argument("--sitemap", nargs="*", default=None, help="Sitemap URLs")
+    parser.add_argument("--max-pages", type=int, default=None, help="Maximum number of pages")
+    parser.add_argument("--max-depth", type=int, default=None, help="Maximum crawl depth")
+    parser.add_argument("--output", default=None, help="JSON file for exported statistics")
+    parser.add_argument("--html-report", default=None, help="HTML report output path")
+    parser.add_argument("--config", default=None, help="JSON or YAML configuration file")
+    parser.add_argument("--respect-robots", dest="respect_robots", action="store_true", default=None, help="Respect robots.txt")
+    parser.add_argument("--rate-limit", type=float, default=None, help="Requests per second")
+    parser.add_argument("--storage-type", choices=["json", "csv", "sqlite"], default=None, help="Storage backend")
+    parser.add_argument("--storage-path", default=None, help="Storage path")
+    parser.add_argument("--log-file", default=None, help="Rotating log file")
+    parser.add_argument("--log-level", default=None, help="Log level")
+    return parser
+
+
+def config_from_cli_args(args: argparse.Namespace) -> CrawlerConfig:
+    base_config = CrawlerConfig.from_file(args.config) if getattr(args, "config", None) else None
+    config_data = base_config.to_dict() if base_config is not None else {}
+    if args.urls is not None:
+        config_data["start_urls"] = list(args.urls)
+    if args.sitemap is not None:
+        config_data["sitemap_urls"] = list(args.sitemap)
+    if args.max_pages is not None:
+        config_data["max_pages"] = args.max_pages
+    if args.max_depth is not None:
+        config_data["max_depth"] = args.max_depth
+    if args.output is not None:
+        config_data["output_json"] = args.output
+    if args.html_report is not None:
+        config_data["output_html"] = args.html_report
+    if args.respect_robots is not None:
+        config_data["respect_robots"] = args.respect_robots
+    if args.rate_limit is not None:
+        config_data["requests_per_second"] = args.rate_limit
+    if args.storage_type is not None:
+        config_data["storage_type"] = args.storage_type
+    if args.storage_path is not None:
+        config_data["storage_path"] = args.storage_path
+    if args.log_file is not None:
+        config_data["log_file"] = args.log_file
+    if args.log_level is not None:
+        config_data["log_level"] = args.log_level
+    return CrawlerConfig.from_dict(config_data)
+
+
+async def run_advanced_crawler_with_config(config: CrawlerConfig) -> dict[str, object]:
+    crawler = AdvancedCrawler(config)
+    try:
+        await crawler.crawl()
+        return crawler.get_stats()
+    finally:
+        await crawler.close()
+
+
+def run_advanced_crawler_cli(argv: list[str] | None = None) -> int:
+    parser = build_advanced_crawler_arg_parser()
+    args = parser.parse_args(argv)
+    config = config_from_cli_args(args)
+    asyncio.run(run_advanced_crawler_with_config(config))
+    return 0
